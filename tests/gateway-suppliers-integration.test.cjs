@@ -7,6 +7,7 @@ const path = require('node:path');
 const http = require('node:http');
 const { chromium } = require('playwright');
 
+const { launchBrowser } = require('./browser-launch.cjs');
 process.env.NO_PROXY = process.env.no_proxy = '127.0.0.1,localhost';
 const root = path.resolve(__dirname, '../ui');
 const evidence = path.resolve(__dirname, '../.agent-sync/codex-supplier-audit-20261108-163813-5727-evidence');
@@ -289,7 +290,7 @@ async function exercise(browser, viewport) {
   fs.mkdirSync(evidence, { recursive: true });
   let browser;
   try {
-    browser = await chromium.launch({ channel: 'chrome', headless: true });
+    browser = await launchBrowser({});
     for (const viewport of [{ width: 940, height: 620 }, { width: 1320, height: 860 }]) await exercise(browser, viewport);
     console.log(JSON.stringify({ result: 'PASS', evidence }));
   } finally {

@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 const ROUNDS: i64 = 150_000;
@@ -215,6 +216,10 @@ fn entropy_now() -> Vec<u8> {
 /// 内存里的明文库重新加密写盘。整包一次 DPAPI，省得几十个 key 弹几十次进程。
 /// 锁定状态（CACHE 是 None）必须拒绝写：那时内存里没有原有凭据，一写就把整包覆盖了。
 pub fn flush() -> Result<(), String> {
+    // T6：先清 dirty 再写。写失败由调用方感知；写成功后台不再重复。
+    // 若写盘期间又有 put 置脏，后台下一轮会再写一次，不会丢。
+    DIRTY.store(false, Ordering::SeqCst);
+    LAST_FLUSH_MS.store(now_ms(), Ordering::SeqCst);
     let map = match CACHE.lock() {
         Ok(g) => match g.as_ref() {
             Some(m) => m.clone(),
@@ -265,6 +270,8 @@ fn load_map(text: &[u8]) {
             if let Ok(mut g) = CACHE.lock() {
                 *g = Some(m);
             }
+            // T6：刚从磁盘读进来的内容与磁盘一致，没有未落盘修改。
+            DIRTY.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -337,6 +344,8 @@ pub fn put(id: &str, value: &str) -> bool {
         Ok(mut g) => match g.as_mut() {
             Some(m) => {
                 m.insert(id.to_string(), value.to_string());
+                mark_dirty();
+                crate::proxy::invalidate_legacy_pool(); // T7：token 变更影响路由可用性
                 true
             }
             None => false,
@@ -348,8 +357,73 @@ pub fn put(id: &str, value: &str) -> bool {
 pub fn remove(id: &str) {
     if let Ok(mut g) = CACHE.lock() {
         if let Some(m) = g.as_mut() {
-            m.remove(id);
+            if m.remove(id).is_some() {
+                mark_dirty();
+                crate::proxy::invalidate_legacy_pool(); // T7：token 移除影响路由可用性
+            }
         }
+    }
+}
+
+// ---------------------------------------------------------------- T6 批量落盘
+//
+// 原先每次 put/remove 后调用方都立刻 flush()：整包重新 DPAPI 加密 + 起一个
+// PowerShell（高负载实测冷启 3~5s）。批量登记 10 个账号就是 10 次进程。
+// 现在 put/remove 只置脏，由三条路收口：
+//   1. 后台线程每 ≤1s 看一眼，脏了且距上次写 ≥5s 才 flush（连续写合并成一次）；
+//   2. 关键路径（改名/导入等要求立刻持久化的）仍直接调 flush()，语义不变；
+//   3. 退出钩子（lifecycle::exit）强制 flush，崩溃丢写窗口 ≤5s。
+// 锁定（CACHE=None）时 flush 本就拒绝写，置脏无副作用。
+
+/// 有未落盘的修改。put/remove 置位；flush 开头清位。
+static DIRTY: AtomicBool = AtomicBool::new(false);
+/// 上次成功进入 flush 的时刻（毫秒 epoch）；后台据此做 ≥5s 合并窗口。
+static LAST_FLUSH_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 后台 flush 线程只起一次。
+static FLUSH_THREAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn mark_dirty() {
+    DIRTY.store(true, Ordering::SeqCst);
+    ensure_flush_thread();
+}
+
+/// 是否有未落盘修改（测试与诊断用）。
+pub fn is_dirty() -> bool {
+    DIRTY.load(Ordering::SeqCst)
+}
+
+/// 起后台收口线程（幂等）。首次置脏时自动拉起；也可在启动时显式调用。
+/// 测试进程里不拉：避免单测的 put 触发后台真写用户 vault.json。
+pub fn ensure_flush_thread() {
+    if cfg!(test) {
+        return;
+    }
+    FLUSH_THREAD.get_or_init(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if !DIRTY.load(Ordering::SeqCst) {
+                continue;
+            }
+            let last = LAST_FLUSH_MS.load(Ordering::SeqCst);
+            if last != 0 && now_ms().saturating_sub(last) < 5_000 {
+                continue; // 合并窗口内：让连续写攒成一次
+            }
+            let _ = flush();
+        });
+    });
+}
+
+/// 退出钩子用：有脏就立刻写，不等合并窗口。锁定状态 flush 自己会拒绝。
+pub fn flush_on_exit() {
+    if DIRTY.load(Ordering::SeqCst) {
+        let _ = flush();
     }
 }
 
@@ -431,6 +505,10 @@ pub fn set_password(pwd: &str, again: &str, hint: &str) -> (bool, String) {
     if let Ok(mut g) = ENTROPY.lock() {
         *g = Some(key);
     }
+    // T6：本函数已按新 entropy 整包写盘，清掉脏标志——
+    // 否则后台 flush 可能拿旧时序的脏状态再写一遍，徒增一次 PowerShell。
+    DIRTY.store(false, Ordering::SeqCst);
+    LAST_FLUSH_MS.store(now_ms(), Ordering::SeqCst);
     (
         true,
         format!(
@@ -521,6 +599,9 @@ pub fn remove_password() -> (bool, String) {
     if let Ok(mut g) = ENTROPY.lock() {
         *g = None;
     }
+    // T6：同 set_password——已整包写盘，清脏，避免后台重复加密。
+    DIRTY.store(false, Ordering::SeqCst);
+    LAST_FLUSH_MS.store(now_ms(), Ordering::SeqCst);
     (
         true,
         format!("已移除主密码，{} 个凭据退回只靠 Windows 账户这一层保护。", map.len()),
@@ -572,5 +653,47 @@ mod tests {
         assert_eq!(a, b, "同盐同密码要出同一把钥匙");
         assert_eq!(a.len(), 32);
         assert_ne!(a, c, "差一个字符就该完全不同");
+    }
+
+    // ---------------- T6 批量落盘：机制测试（不触发 DPAPI/PowerShell） ----------------
+    // CACHE/DIRTY 是全局静态，cargo 同进程并行跑测试——三个断言段必须串在
+    // 一条测试里顺序执行，拆成三条会互相踩状态。
+
+    /// 1) put/remove 置脏（后台/退出收口能拿到活的前提；删 mark_dirty 即红）；
+    /// 2) 锁定态 put 拒绝且不置脏（否则退出钩子白跑注定失败的 flush）；
+    /// 3) flush 进入即清脏并记时刻（锁定态早退路径同样清）。
+    #[test]
+    fn t6_dirty_semantics() {
+        // 段 1：可用态置脏
+        {
+            let mut g = CACHE.lock().unwrap();
+            if g.is_none() {
+                *g = Some(HashMap::new());
+            }
+        }
+        DIRTY.store(false, Ordering::SeqCst);
+        assert!(put("t6-probe-key", "v"));
+        assert!(DIRTY.load(Ordering::SeqCst), "put 后必须置脏（T6 回退即红）");
+        DIRTY.store(false, Ordering::SeqCst);
+        remove("t6-probe-key");
+        assert!(DIRTY.load(Ordering::SeqCst), "remove 命中后必须置脏");
+        remove("t6-probe-key"); // 清理测试键
+
+        // 段 2：锁定态拒绝且不置脏
+        let saved = CACHE.lock().unwrap().take();
+        DIRTY.store(false, Ordering::SeqCst);
+        assert!(!put("t6-locked-key", "v"), "锁定必须拒绝");
+        assert!(!DIRTY.load(Ordering::SeqCst), "锁定拒绝不得置脏");
+
+        // 段 3：flush 进入即清脏（锁定态早退，不触发 DPAPI）
+        DIRTY.store(true, Ordering::SeqCst);
+        let r = flush();
+        assert!(r.is_err(), "锁定态 flush 应拒绝写");
+        assert!(!DIRTY.load(Ordering::SeqCst), "flush 进入即清脏");
+        assert!(LAST_FLUSH_MS.load(Ordering::SeqCst) > 0, "应记录 flush 时刻");
+
+        // 还原全局状态，避免污染同进程其它测试
+        *CACHE.lock().unwrap() = saved;
+        DIRTY.store(false, Ordering::SeqCst);
     }
 }

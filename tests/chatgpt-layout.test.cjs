@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const { chromium } = require('playwright');
+const { launchBrowser } = require('./browser-launch.cjs');
 const root = path.resolve(__dirname, '../ui');
 const artifacts = path.resolve(__dirname, '../.agent-sync/layout-evidence');
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.png': 'image/png' };
@@ -178,7 +179,7 @@ async function verifyClaudeDesktop(page, zoom) {
   fs.mkdirSync(artifacts, { recursive: true });
   let browser;
   try {
-    browser = await chromium.launch({ channel: 'chrome', headless: true });
+    browser = await launchBrowser({});
     const page = await browser.newPage();
     const errors = []; page.on('pageerror', e => errors.push(e.message));
     await page.addInitScript(() => localStorage.setItem('cockpit-toured', '1'));

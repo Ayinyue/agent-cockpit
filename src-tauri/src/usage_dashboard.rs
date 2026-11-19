@@ -422,7 +422,8 @@ fn collect_sources() -> (Vec<Value>, HashMap<String, Value>, HashMap<String, Str
             // Same canonical directory, including junction aliases, is counted once.
             let mut local_error = None;
             let local = if let Some(t) = profiles.get(&key).cloned() { Some(t) }
-                else { match crate::usage::collect_with_error(if app.id == "codex-desktop" { "chatgpt" } else { &app.id }, &dir.to_string_lossy()) {
+                // 看板要跨账号去重，必须拿逐条记录；账号卡片那条路走轻包（见 usage.rs）。
+                else { match crate::usage::collect_with_records(if app.id == "codex-desktop" { "chatgpt" } else { &app.id }, &dir.to_string_lossy()) {
                     Ok(t) => t,
                     Err(reason) => {
                         profile_errors.insert(key.clone(), reason.clone());

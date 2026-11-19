@@ -4,6 +4,9 @@
 #![recursion_limit = "256"]
 
 mod agenthub;
+mod agentcrypt;
+#[cfg(windows)]
+mod dpapi_native;
 mod ai;
 mod brand;
 mod antigravity;
@@ -20,6 +23,7 @@ mod claude_gateway;
 mod agentfind;
 mod companion;
 mod discover;
+mod dev_ui;
 mod doubao;
 mod expiry;
 mod gateway;
@@ -67,6 +71,9 @@ mod zcode;
 mod zcproxy;
 
 use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use serde_json::Value;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
@@ -133,6 +140,12 @@ fn main() {
         lifecycle::exit();
         std::process::exit(if success {0} else {1});
     }
+    // 调试构建的窗口地址是编译期注入的 devUrl（Tauri CLI 的内置静态服务，默认 1430）。
+    // 从快捷方式直接开 debug exe 时那个服务并不存在，窗口会整屏 ERR_CONNECTION_REFUSED；
+    // 端口没人听就自己起一个，详见 dev_ui。release 构建没有 devUrl，这一步直接跳过。
+    let context = tauri::generate_context!();
+    #[cfg(dev)]
+    dev_ui::ensure(context.config());
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -200,13 +213,19 @@ fn main() {
                 .as_u64()
                 .unwrap_or(registry::PROXY_PORT as u64) as u16;
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(8));
+                // 原先固定 sleep(8) 才动手。但反代**不在启动时自动恢复**（见下方注释），
+                // 也就是说这 8 秒绝大多数时候在等一个不会发生的事件，白拖慢开机后的清理。
+                // 改成有界轮询：网关一旦真的起来就立刻按「只补待清理」走；
+                // 没起来则最多等满原来的 8 秒上限再全量清扫——上限不放宽，只去掉无谓等待。
+                use tauri::Manager;
+                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                let running = loop {
+                    let running = cleanup_handle.state::<commands::AppState>().proxy.is_running();
+                    if running || std::time::Instant::now() >= deadline { break running; }
+                    std::thread::sleep(Duration::from_millis(200));
+                };
                 // 网关没开着时，客户端里指向它的模型就是死条目（上一次没清干净的）；
                 // 全量清扫会还原/兜底清理它们；开着时只补做待清理。
-                let running = {
-                    use tauri::Manager;
-                    cleanup_handle.state::<commands::AppState>().proxy.is_running()
-                };
                 let result = if running {
                     gateway_cleanup::retry_pending(port)
                 } else {
@@ -256,7 +275,7 @@ fn main() {
             commands::set_settings,
             commands::set_autostart
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("Agent 驾驶舱启动失败");
     // RunEvent::Exit 只在正常走完退出流程时触发。所以日志里「有 start、没有配对的 exit」
     // 就说明是被外部结束的——换 exe 的 Stop-Process、任务管理器、系统关机。
@@ -465,6 +484,84 @@ fn refresh_chatgpt_tray(app: &tauri::AppHandle, submenu: &Submenu<tauri::Wry>) -
     }
 }
 
+#[cfg(test)]
+mod autofetch_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn inst(name: &str, bound: &str) -> Value {
+        serde_json::json!({"name": name, "quota_user_id": bound, "data_dir": format!("/tmp/{name}")})
+    }
+
+    /// T12：未绑定账号不提交取数（首次绑定必须用户手动点）。
+    /// 变异探针：去掉 bound.is_empty() 跳过，本条即红。
+    #[test]
+    fn unbound_accounts_are_skipped() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s2 = seen.clone();
+        let instances = vec![inst("a", ""), inst("b", "uid-b"), inst("c", "")];
+        run_local_quota_batch(&instances, move |_m, bound, _d, _uo| {
+            assert!(!bound.is_empty(), "未绑定账号不该进 worker");
+            s2.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "只有绑定的 b 应被取数");
+    }
+
+    /// T12：usage_only 置位后，后续账号全部跳过（等价原串行 break）。
+    /// 用 7 个账号（>3，跨多批）确保标志在批间也生效。
+    /// 变异探针：去掉 usage_only.load 跳过，本条即红。
+    #[test]
+    fn usage_only_stops_subsequent_accounts() {
+        let processed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let p2 = processed.clone();
+        let instances: Vec<Value> = (0..7).map(|i| inst(&format!("a{i}"), &format!("uid-{i}"))).collect();
+        run_local_quota_batch(&instances, move |m, _b, _d, uo| {
+            let name = m["name"].as_str().unwrap_or("").to_string();
+            p2.lock().unwrap().push(name.clone());
+            // 第一个账号判定 usage_only（全机共享累计数）
+            if name == "a0" {
+                uo.store(true, Ordering::SeqCst);
+            }
+        });
+        let got = processed.lock().unwrap();
+        // a0 必然处理；a0 同批的 a1/a2 可能已并发启动（批内），但后续批 a3~a6 必须全跳过
+        assert!(got.contains(&"a0".to_string()), "首个账号应处理");
+        for later in ["a3", "a4", "a5", "a6"] {
+            assert!(!got.contains(&later.to_string()), "usage_only 后的批必须跳过 {later}（T12 回退即红）");
+        }
+    }
+
+    /// T12：并发上限恒 3（分批 spawn，批内最多 3 个同时跑）。
+    /// 用屏障计数验证任一时刻活跃 worker ≤3。变异探针：把 chunks(3) 改大，本条即红。
+    #[test]
+    fn concurrency_capped_at_three() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (a2, p2) = (active.clone(), peak.clone());
+        let instances: Vec<Value> = (0..9).map(|i| inst(&format!("a{i}"), &format!("uid-{i}"))).collect();
+        run_local_quota_batch(&instances, move |_m, _b, _d, _uo| {
+            let cur = a2.fetch_add(1, Ordering::SeqCst) + 1;
+            p2.fetch_max(cur, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30)); // 留出重叠窗口
+            a2.fetch_sub(1, Ordering::SeqCst);
+        });
+        assert!(peak.load(Ordering::SeqCst) <= 3, "并发峰值 {} 超过上限 3（T12 回退即红）", peak.load(Ordering::SeqCst));
+        assert!(peak.load(Ordering::SeqCst) >= 2, "应真并发（峰值≥2），否则退化成串行");
+    }
+
+    /// T12：全部绑定账号都被处理（无遗漏），且每个恰好一次。
+    #[test]
+    fn all_bound_accounts_processed_once() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c2 = count.clone();
+        let instances: Vec<Value> = (0..5).map(|i| inst(&format!("a{i}"), &format!("uid-{i}"))).collect();
+        run_local_quota_batch(&instances, move |_m, _b, _d, _uo| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 5, "5 个绑定账号应各处理一次");
+    }
+}
+
 /// 后台循环：启动先扫一遍本机新装程序，再提醒临期额度，之后按设置里的间隔抓取 + 复查
 fn quota_watch_loop(app: tauri::AppHandle) {
     if settings::get()["general"]["auto_scan"].as_bool().unwrap_or(true) {
@@ -526,66 +623,20 @@ fn autofetch_once() {
     for app_def in registry::all_apps() {
         // 能本机直读的产品优先走本机：不联网、拿到的就是客户端里那个真数
         if let Some(store) = local_quota::store_for(&app_def.id) {
-            for meta in registry::load_instances(&app_def.id) {
-                // 只有"累计已用"的产品不进后台自动刷：它是全机共享的，自动写会把
-                // 同一个累计数灌进每个账号档案，多账号用户会被误导。要点就点。
-                let data_dir = meta["data_dir"].as_str().unwrap_or("");
-                let bound = meta["quota_user_id"].as_str().unwrap_or("").trim().to_string();
-                // 没绑定过的档案不自动写：否则本机当前登录的那个号会被灌进所有空档案，
-                // 看起来像"每个账号余额都一样"。首次绑定必须由用户手动点「从本机读取」。
-                if bound.is_empty() {
-                    continue;
-                }
-                // 这张卡的明细本来是官网逐包读进来的，后台就继续走官网：本机那条接口对
-                // Qoder 只给「主额度 + 附加包」两个汇总数，每半小时一轮就会把二十几笔逐包
-                // 压回一行"到期时间未给出"。守卫挡得住覆盖，挡不住"明细从此再也不更新"。
-                // 官网会话掉了才退回本机读数刷汇总数，并把原因记下来让界面提示重新登录。
-                if meta["quota_detail_source"].as_str() == Some("web")
-                    && webquota::supports(&app_def.id)
-                {
-                    // 起线程再 join：官网取数要建隐藏窗口、调三次接口，万一在这儿 panic，
-                    // 直接跑在循环线程上会把整轮自动取数和临期提醒一起带走
-                    let id = app_def.id.clone();
-                    let mm = meta.clone();
-                    let w = std::thread::spawn(move || webquota::fetch(&id, &mm))
-                        .join()
-                        .unwrap_or_else(|_| serde_json::json!({ "ok": false, "msg": "官网取数崩了一次" }));
-                    if w["ok"].as_bool() == Some(true) {
-                        // 防串号同一条规矩：这个号的会话里登成了别人，就不能写进这张卡。
-                        // 光跳过不行——卡片会一声不响地停在旧数上，得把原因记下来让它说得出话
-                        if w["user_id"].as_str().unwrap_or("") == bound {
-                            registry::save_instance(&app_def.id, &webquota::apply(&meta, &w));
-                            continue;
-                        }
-                        let mut m = meta.clone();
-                        m["quota_web_error"] = serde_json::json!(format!(
-                            "这个号自己的官网窗口里登的是「{}」，不是卡上绑的号",
-                            w["account"].as_str().unwrap_or("?")
-                        ));
-                        registry::save_instance(&app_def.id, &m);
-                    } else {
-                        let mut m = meta.clone();
-                        m["quota_web_error"] = serde_json::json!(
-                            w["msg"].as_str().unwrap_or("官网读不到")
-                        );
-                        registry::save_instance(&app_def.id, &m);
-                    }
-                }
-                // 实例目录里没有它自己的登录数据时读本机当前登录（Qoder 的登录态在 %APPDATA%），
-                // 能不能写给这张卡由下面的 userId 校验把关——对不上号就 continue，不会串号
-                let q = match local_quota::fetch_for_account(store, data_dir) {
-                    Ok(q) => q,
-                    Err(_) => continue,   // 这台机器上一个号都没登过 → 不写
-                };
-                if q.is_usage_only() {
-                    break;
-                }
-                // 档案里登录的不是绑定的那个号：跳过，绝不把 A 号的余额记到 B 号头上
-                if bound != q.user_id {
-                    continue;
-                }
-                registry::save_instance(&app_def.id, &local_quota::apply(&meta, &q));
-            }
+            // T12：产品内账号取数改受控并发（3 worker）。原先逐账号串行起 python，
+            // 每个账号一次冷启（实测中位 ~1s），N 账号线性叠加；并发后墙钟 ≈ 最慢账号。
+            // 护栏逐条保留：未绑定不写 / web 明细回退 / 防串号 / usage_only 整产品停。
+            let instances = registry::load_instances(&app_def.id);
+            let app_id = app_def.id.clone();
+            let store = store.to_string();
+            // T5：先批量预取「标准直读」账号（一次进程冷启），结果按 data_dir 缓存；
+            // autofetch_local_account 优先用缓存，未命中/批量失败回退逐账号 fetch_for_account。
+            // zcode/workbuddy/trae 等回落或特殊路径不进批量（守卫/登录包逻辑在单账号路）。
+            let prefetch = prefetch_local_quotas(&store, &instances);
+            let prefetch = std::sync::Arc::new(prefetch);
+            run_local_quota_batch(&instances, move |meta, bound, data_dir, uo| {
+                autofetch_local_account(&app_id, &store, meta, bound, data_dir, uo, &prefetch);
+            });
             continue;
         }
         for meta in registry::load_instances(&app_def.id) {
@@ -607,14 +658,17 @@ fn autofetch_once() {
             // CLI 工具的本地会话用量（Codex / Claude Code）：不依赖官方配额接口
             if app_def.id == "codex" || app_def.id == "claude" {
                 let dir = meta["data_dir"].as_str().unwrap_or("");
-                if let Some(u) = usage::compute(&app_def.id, dir) {
+                // T1：一次采集派生汇总与按天序列，省掉第二次 collect 的缓存克隆。
+                // 读不到留旧值，不用 null 覆盖（口径同 local_quota）。
+                let (u, t) = usage::compute_pair(&app_def.id, dir);
+                if let Some(u) = u {
                     m["usage"] = u;
                     m["usage_fetched_at"] = serde_json::json!(now_ts());
                     changed = true;
                 }
                 // 按天序列：波形图 / 热力图的数据源。读不到就留旧的那份，
                 // 不用 null 覆盖（local_quota 对 trend 也是同样口径）
-                if let Some(t) = usage::compute_trend(&app_def.id, dir) {
+                if let Some(t) = t {
                     m["quota_trend"] = t;
                     changed = true;
                 }
@@ -650,6 +704,151 @@ fn now_ts() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// T12：产品内账号受控并发调度（从 autofetch_once 抽出，便于单测注入 mock 取数）。
+/// 分批 spawn，每批最多 3 个，join 完再下一批——批内并发、批间串行，并发上限恒 3，
+/// 不引线程池 crate（零新依赖）。护栏：
+/// - 未绑定（quota_user_id 空）的账号不提交（首次绑定必须用户手动点）；
+/// - usage_only 共享标志一旦置位，后续账号全部跳过（等价原串行 break：全机共享累计数不灌进每个档案）。
+/// `fetch` 闭包接收 (meta, bound, data_dir, usage_only标志)，在 worker 线程里执行取数+校验+写回。
+fn run_local_quota_batch<F>(instances: &[Value], fetch: F)
+where
+    F: Fn(&Value, &str, &str, &AtomicBool) + Send + Sync + 'static,
+{
+    let usage_only = Arc::new(AtomicBool::new(false));
+    let fetch = Arc::new(fetch);
+    let mut handles = Vec::new();
+    for chunk in instances.chunks(3) {
+        for meta in chunk {
+            let data_dir = meta["data_dir"].as_str().unwrap_or("").to_string();
+            let bound = meta["quota_user_id"].as_str().unwrap_or("").trim().to_string();
+            if bound.is_empty() {
+                continue;
+            }
+            if usage_only.load(Ordering::SeqCst) {
+                continue;
+            }
+            let meta = meta.clone();
+            let uo = usage_only.clone();
+            let f = fetch.clone();
+            handles.push(std::thread::spawn(move || {
+                f(&meta, &bound, &data_dir, &uo);
+            }));
+        }
+        for h in handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+/// T12：单账号本机直读取数（从 autofetch_once 抽出，供并发 worker 调用）。
+/// 护栏与原串行版逐条一致：
+/// - web 明细卡优先走官网，官网会话掉了才退回本机刷汇总；
+/// - 防串号：读到的 user_id 与卡上绑定不符就不写（并记下原因）；
+/// - usage_only：置共享标志，让同产品后续账号跳过（等价原 break）。
+/// T5：批量预取一个产品的「标准直读」账号额度，按 data_dir 缓存。
+/// 只收 `!falls_back_to_default` 且已绑定的账号（zcode/workbuddy/trae 等回落或特殊路径不进批量）。
+/// 批量整轮失败 → 返回空缓存，autofetch_local_account 全部回退逐账号 fetch_for_account（T12 并发仍在）。
+/// 返回 HashMap<data_dir, Option<Quota>>：Some=批量取到，None=该账号批量失败（回退单账号重试）。
+fn prefetch_local_quotas(
+    store: &str,
+    instances: &[Value],
+) -> std::collections::HashMap<String, Option<local_quota::Quota>> {
+    let mut cache = std::collections::HashMap::new();
+    // 收集标准直读账号（批量路不处理回落/特殊路径）
+    let mut targets: Vec<(String, Option<String>)> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
+    for meta in instances {
+        let bound = meta["quota_user_id"].as_str().unwrap_or("").trim();
+        if bound.is_empty() {
+            continue;
+        }
+        let data_dir = meta["data_dir"].as_str().unwrap_or("").to_string();
+        if local_quota::falls_back_to_default(store, &data_dir) {
+            continue;
+        }
+        targets.push((store.to_string(), Some(data_dir.clone())));
+        dirs.push(data_dir);
+    }
+    if targets.is_empty() {
+        return cache;
+    }
+    match local_quota::fetch_batch_raw(&targets) {
+        Ok(raws) => {
+            for (dir, raw) in dirs.iter().zip(raws.iter()) {
+                // 复用单账号同一套解析（parse_quota_output 取 [0]）：raw 是完整数组
+                let stdout = serde_json::to_vec(raw).unwrap_or_default();
+                let q = local_quota::parse_quota_output(store, Some(dir.as_str()), true, &stdout, &[]);
+                cache.insert(dir.clone(), q.ok());
+            }
+        }
+        Err(_) => {
+            // 批量整轮失败：空缓存，全部回退逐账号（不写 None，让单账号路重试）
+        }
+    }
+    cache
+}
+
+fn autofetch_local_account(
+    app_id: &str,
+    store: &str,
+    meta: &Value,
+    bound: &str,
+    data_dir: &str,
+    usage_only: &AtomicBool,
+    prefetch: &std::collections::HashMap<String, Option<local_quota::Quota>>,
+) {
+    // 这张卡的明细本来是官网逐包读进来的，后台就继续走官网：本机那条接口对
+    // Qoder 只给「主额度 + 附加包」两个汇总数，每半小时一轮就会把二十几笔逐包
+    // 压回一行"到期时间未给出"。守卫挡得住覆盖，挡不住"明细从此再也不更新"。
+    // 官网会话掉了才退回本机读数刷汇总数，并把原因记下来让界面提示重新登录。
+    if meta["quota_detail_source"].as_str() == Some("web") && webquota::supports(app_id) {
+        // 起线程再 join：官网取数要建隐藏窗口、调三次接口，万一在这儿 panic，
+        // 不能把整轮自动取数和临期提醒一起带走
+        let id = app_id.to_string();
+        let mm = meta.clone();
+        let w = std::thread::spawn(move || webquota::fetch(&id, &mm))
+            .join()
+            .unwrap_or_else(|_| serde_json::json!({ "ok": false, "msg": "官网取数崩了一次" }));
+        if w["ok"].as_bool() == Some(true) {
+            // 防串号同一条规矩：这个号的会话里登成了别人，就不能写进这张卡。
+            if w["user_id"].as_str().unwrap_or("") == bound {
+                registry::save_instance(app_id, &webquota::apply(meta, &w));
+                return;
+            }
+            let mut m = meta.clone();
+            m["quota_web_error"] = serde_json::json!(format!(
+                "这个号自己的官网窗口里登的是「{}」，不是卡上绑的号",
+                w["account"].as_str().unwrap_or("?")
+            ));
+            registry::save_instance(app_id, &m);
+        } else {
+            let mut m = meta.clone();
+            m["quota_web_error"] = serde_json::json!(w["msg"].as_str().unwrap_or("官网读不到"));
+            registry::save_instance(app_id, &m);
+        }
+    }
+    // 实例目录里没有它自己的登录数据时读本机当前登录（Qoder 的登录态在 %APPDATA%），
+    // 能不能写给这张卡由下面的 userId 校验把关——对不上号就跳过，不会串号。
+    // T5：优先用批量预取缓存（一次冷启已取到）；未命中/批量失败回退逐账号 fetch_for_account。
+    let q = match prefetch.get(data_dir) {
+        Some(Some(q)) => q.clone(),
+        _ => match local_quota::fetch_for_account(store, data_dir) {
+            Ok(q) => q,
+            Err(_) => return, // 这台机器上一个号都没登过 → 不写
+        },
+    };
+    if q.is_usage_only() {
+        // 全机共享的累计数：置标志让同产品后续账号都跳过（等价原串行 break）
+        usage_only.store(true, Ordering::SeqCst);
+        return;
+    }
+    // 档案里登录的不是绑定的那个号：跳过，绝不把 A 号的余额记到 B 号头上
+    if bound != q.user_id {
+        return;
+    }
+    registry::save_instance(app_id, &local_quota::apply(meta, &q));
 }
 
 fn notify_alerts(app: &tauri::AppHandle) {

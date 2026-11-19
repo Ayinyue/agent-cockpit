@@ -461,7 +461,7 @@ def blank_bucket():
     return bucket
 
 
-def aggregate(records, source, source_key, files, errors=0):
+def aggregate(records, source, source_key, files, errors=0, with_records=True):
     days = {}
     summary = blank_bucket()
     unique = {}
@@ -494,17 +494,23 @@ def aggregate(records, source, source_key, files, errors=0):
         return None
     peak = max(out, key=lambda x: x["tokens"]) if out else {"tokens": 0, "date": ""}
     has_estimate = summary["estimated_tokens"] > 0
-    return dict(unit="tokens", days=out, total=summary["tokens"], peak=peak["tokens"], peak_date=peak["date"],
-                source=source, source_key=source_key, files=files, **summary,
-                coverage="本机该数据目录中可读的模型记录；自定义接口仅在客户端保存记录时计入。" +
-                ("部分记录没有 usage，按可见输入输出文本估算，不含隐藏提示、重复上下文和缓存。" if has_estimate else ""),
-                estimate_method="CJK 字符约 1 token，其余字符约 4 字符/token；仅估算可见文本" if has_estimate else "",
-                partial=errors > 0, unreadable_files=errors,
-                undated_tokens=sum(r["tokens"] for r in unique.values() if not r["date"]),
-                attribution="local-profile", duration_basis="request-wall-time",
-                _records=[{k: v for k, v in r.items() if k not in METRICS or v != 0}
-                          for r in unique.values()],
-                requests_basis="模型用量记录数；日志事件未必与 HTTP 请求或用户轮次一一对应")
+    result = dict(unit="tokens", days=out, total=summary["tokens"], peak=peak["tokens"], peak_date=peak["date"],
+                  source=source, source_key=source_key, files=files, **summary,
+                  coverage="本机该数据目录中可读的模型记录；自定义接口仅在客户端保存记录时计入。" +
+                  ("部分记录没有 usage，按可见输入输出文本估算，不含隐藏提示、重复上下文和缓存。" if has_estimate else ""),
+                  estimate_method="CJK 字符约 1 token，其余字符约 4 字符/token；仅估算可见文本" if has_estimate else "",
+                  partial=errors > 0, unreadable_files=errors,
+                  undated_tokens=sum(r["tokens"] for r in unique.values() if not r["date"]),
+                  attribution="local-profile", duration_basis="request-wall-time",
+                  requests_basis="模型用量记录数；日志事件未必与 HTTP 请求或用户轮次一一对应")
+    # 逐条记录只有用量看板的跨账号去重用得到（usage_dashboard.rs 的 prepare_narrow_views /
+    # deduplicate_sources）。账号卡片与波形图只要汇总，带上它纯属浪费：
+    # 2026-11-18 实测同一源整包 7.04 MB 里 6.96 MB 是 _records（98.9%），
+    # 序列化 213.3 ms → 2.5 ms，还要再经 stdin/stdout 管道与 Rust 侧 serde 解析一遍。
+    if with_records:
+        result["_records"] = [{k: v for k, v in r.items() if k not in METRICS or v != 0}
+                              for r in unique.values()]
+    return result
 
 
 SOURCES = {"codex": "本机 Codex 会话日志", "claude": "本机 Claude Code 会话日志",
@@ -515,7 +521,11 @@ SOURCES = {"codex": "本机 Codex 会话日志", "claude": "本机 Claude Code �
            "dsh": "本机 DSH 会话日志逐条 usage"}
 
 
-def collect(app, root, cache_dir=None):
+def collect(app, root, cache_dir=None, with_records=True):
+    """汇总本机用量。with_records=False 时不产出逐条记录（账号卡片/波形图用）。
+
+    默认 True 保持既有契约：老调用方（含外部脚本）不传这个参数时行为不变。
+    """
     if not root or not str(root).strip():
         return None
     root = Path(root).expanduser().resolve()
@@ -587,7 +597,8 @@ def collect(app, root, cache_dir=None):
             temporary.replace(cache_path)
         except OSError:
             pass
-    result = aggregate(records, SOURCES.get(app, "本机 " + app + " 会话日志"), source_key, files, errors)
+    result = aggregate(records, SOURCES.get(app, "本机 " + app + " 会话日志"), source_key, files, errors,
+                       with_records=with_records)
     if result is None and errors:
         return {"error": "本地用量文件读取失败，请检查文件权限与数据库状态。"}
     return result
@@ -596,7 +607,8 @@ def collect(app, root, cache_dir=None):
 if __name__ == "__main__":
     request = json.load(sys.stdin)
     try:
-        result = collect(request.get("app_id", ""), request.get("data_dir", ""), request.get("cache_dir"))
+        result = collect(request.get("app_id", ""), request.get("data_dir", ""), request.get("cache_dir"),
+                         with_records=bool(request.get("with_records", True)))
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
     except Exception:
         # Do not expose source rows, paths or snippets in an error response.

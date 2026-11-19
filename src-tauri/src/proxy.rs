@@ -16,6 +16,24 @@ use tiny_http::{Header, Response, Server, StatusCode};
 /// 短回答要等整条流结束、慢模型要等好几秒，客户端首包超时就把这一轮判成失败。
 const HEAD_PROBE_MAX: usize = 2048;
 
+/// T11：进程级共享 ureq Agent，连接池跨请求存活。
+/// ureq 2.12 的自由函数（ureq::request/post）每次调用都新建 Agent，响应读完连接随
+/// Agent 一起丢弃——每个转发请求都重付 TCP+TLS 握手。2026-11-19 无凭据探针实测：
+/// 对 openai/anthropic 类上游握手约 380~440ms，占冷连接总耗时 34~42%
+/// （agent-cockpit-health-review/t11_tls_result*.json）。
+/// 这里只改两件事：连接池存活 + 每 host 空闲上限 1→4（默认 1 时并发请求仍互相挤掉连接）。
+/// 其余配置与自由函数路径的默认值逐项一致（30s 连接超时、5 次重定向、gzip、TLS 根证书）；
+/// 各调用点原有的每请求 timeout(300/600s) 语义不变（Request::timeout 覆盖 agent 配置）。
+/// 响应体读完即归还连接池；SSE 长流在读完前独占连接，不影响其它请求。
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .max_idle_connections_per_host(4)
+            .build()
+    })
+}
+
 /// 读到一个完整 SSE 帧（空行收尾）就返回，最多 `HEAD_PROBE_MAX` 字节。
 /// 不能用 `take(N).read_to_end()`：那会一直阻塞到凑满 N 字节或 EOF，
 /// 短回答要等整条流跑完、慢模型要等好几秒，客户端首包超时就把这一轮判成失败。
@@ -49,7 +67,63 @@ pub struct Proxy {
 }
 
 /// 兼容保留：老式（无上游组配置）时的成员清单 = 所有登记过 token 的账号 + 勾了「进反代」的 Key
+///
+/// T7：结果缓存。legacy_pool 每请求都遍历全部产品×账号×Key（N 次文件读 + 保管箱补齐），
+/// 是 P4 点名的热路径。缓存键 = (global_upstream, config.json 的 mtime+大小)，另加 2s TTL：
+/// - config 变化（sources_off/pools/换号记录）→ mtime 键失效；
+/// - 实例/Key/保管箱写入 → 各收口写点显式调 invalidate_legacy_pool()；
+/// - 未挂钩子的散落写点（如个别直接 remove_file）→ TTL 兜底，陈旧窗口 ≤2s。
+/// 2s 远小于前端 4s 轮询，界面与路由都不会感知到陈旧；换来热路径不再每请求扫盘。
 pub fn legacy_pool(global_upstream: &str) -> Vec<Upstream> {
+    let cfg_key = crate::registry::config_cache_signature();
+    let now = std::time::Instant::now();
+    {
+        if let Ok(g) = legacy_pool_cache().lock() {
+            if let Some(entry) = g.as_ref() {
+                if entry.upstream == global_upstream
+                    && entry.cfg_key == cfg_key
+                    && now.duration_since(entry.at) < LEGACY_POOL_TTL
+                {
+                    return entry.ups.clone();
+                }
+            }
+        }
+    }
+    let ups = legacy_pool_uncached(global_upstream);
+    if let Ok(mut g) = legacy_pool_cache().lock() {
+        *g = Some(LegacyPoolCache {
+            upstream: global_upstream.to_string(),
+            cfg_key,
+            at: now,
+            ups: ups.clone(),
+        });
+    }
+    ups
+}
+
+/// T7：写点显式失效。实例/Key/保管箱变更后调用，让下一次 legacy_pool 立即重算。
+pub fn invalidate_legacy_pool() {
+    if let Ok(mut g) = legacy_pool_cache().lock() {
+        *g = None;
+    }
+}
+
+const LEGACY_POOL_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct LegacyPoolCache {
+    upstream: String,
+    cfg_key: Option<(std::time::SystemTime, u64)>,
+    at: std::time::Instant,
+    ups: Vec<Upstream>,
+}
+
+fn legacy_pool_cache() -> &'static Mutex<Option<LegacyPoolCache>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<Option<LegacyPoolCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn legacy_pool_uncached(global_upstream: &str) -> Vec<Upstream> {
     let mut out = Vec::new();
     let off = gateway::sources_off();
     for app in all_apps() {
@@ -298,7 +372,7 @@ impl Proxy {
         let mut v: Value = serde_json::from_slice(body).ok()?;
         v["model"] = json!("auto");
         let b = serde_json::to_vec(&v).ok()?;
-        let mut call = ureq::request(method, url).timeout(std::time::Duration::from_secs(300));
+        let mut call = http_agent().request(method, url).timeout(std::time::Duration::from_secs(300));
         for (k, val) in fwd {
             call = call.set(k, val);
         }
@@ -712,7 +786,7 @@ impl Proxy {
             }
         }
 
-        let mut call = ureq::request(&method, &url).timeout(std::time::Duration::from_secs(300));
+        let mut call = http_agent().request(&method, &url).timeout(std::time::Duration::from_secs(300));
         for (k, v) in &fwd {
             call = call.set(k, v);
         }
@@ -948,7 +1022,7 @@ impl Proxy {
                 return;
             };
             let t0 = std::time::Instant::now();
-            let res = ureq::post(&format!(
+            let res = http_agent().post(&format!(
                 "{}{}",
                 crate::traeproxy::AGENT_HOST,
                 crate::traeproxy::CHAT_PATH
@@ -1099,7 +1173,7 @@ impl Proxy {
 
         // start 可能换过端口，永远打当前监听的那个
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", self.port());
-        let mut call = ureq::post(&url)
+        let mut call = http_agent().post(&url)
             .timeout(std::time::Duration::from_secs(600))
             .set("Content-Type", "application/json")
             .set("Authorization", &format!("Bearer {incoming_key}"))
@@ -1260,7 +1334,7 @@ impl Proxy {
         let up_body = crate::mmproxy::translate_request(&v);
         let used = up_body["model"].as_str().unwrap_or("").to_string();
 
-        let res = ureq::post(&format!("{}/messages", crate::mmproxy::GATEWAY_BASE))
+        let res = http_agent().post(&format!("{}/messages", crate::mmproxy::GATEWAY_BASE))
             .set("Authorization", &format!("Bearer {tok}"))
             .set("anthropic-version", "2023-06-01")
             .set("Content-Type", "application/json")
@@ -1812,7 +1886,7 @@ impl Proxy {
 
             let url = format!("{}/v2/chat/completions", crate::wbproxy::model_base(region));
             let t0 = std::time::Instant::now();
-            let mut call = ureq::post(&url).timeout(std::time::Duration::from_secs(300));
+            let mut call = http_agent().post(&url).timeout(std::time::Duration::from_secs(300));
             for (hk, hv) in &prepared.headers {
                 call = call.set(hk, hv);
             }
@@ -2516,5 +2590,143 @@ mod tests {
         assert_eq!(v["models"]["qoder-cn/bad"]["calls"].as_u64(), Some(2));
         assert_eq!(v["models"]["qoder-cn/bad"]["ok"].as_u64(), Some(2));
         assert_eq!(v["models"]["qoder-cn/bad"]["fail"].as_u64(), Some(0));
+    }
+
+    /// T11：共享 Agent 必须是同一个实例（连接池跨请求存活的前提）。
+    /// 变异探针：把 http_agent 改回每次 AgentBuilder::new().build()，本条即红。
+    #[test]
+    fn http_agent_is_process_wide_singleton() {
+        let a = http_agent() as *const ureq::Agent;
+        let b = http_agent() as *const ureq::Agent;
+        assert_eq!(a, b, "每次拿到新 Agent = 连接池随请求丢弃，T11 回退");
+    }
+
+    /// T11 行为取证：本地起一个计数 TCP 服务，经共享 Agent 连发 3 次请求并读完响应体，
+    /// 服务端只应 accept 到 1 条连接（后两次复用）。不依赖外网、不发任何凭据。
+    /// 变异探针：把调用点改回 ureq::get 自由函数，accepted 会变成 3，本条即红。
+    #[test]
+    fn http_agent_reuses_connection_across_requests() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("绑定测试端口");
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let acc2 = accepted.clone();
+        thread::spawn(move || {
+            // 每条连接服务到对端关闭为止；keep-alive 复用发生在同一条连接内。
+            // 测试进程结束时线程随之回收，不做显式 join。
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                acc2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                loop {
+                    let mut req = Vec::new();
+                    loop {
+                        match s.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                req.extend_from_slice(&buf[..n]);
+                                if req.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if req.is_empty() { break; } // 对端关闭
+                    let body = b"ok";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    if s.write_all(head.as_bytes()).is_err() { break; }
+                    if s.write_all(body).is_err() { break; }
+                }
+            }
+        });
+        let url = format!("http://127.0.0.1:{}/probe", port);
+        for _ in 0..3 {
+            let resp = http_agent()
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .call()
+                .expect("本地探针请求应成功");
+            let mut text = String::new();
+            resp.into_reader().read_to_string(&mut text).expect("应读完响应体（读完才归还连接池）");
+            assert_eq!(text, "ok");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "3 次请求应复用同一条连接；>1 说明连接池没生效（T11 回退）"
+        );
+    }
+
+    /// T7：legacy_pool 结果缓存。子进程隔离数据根与全局缓存静态量。
+    /// 覆盖：同键命中（改实例文件但 TTL 内不重算）/ 写点显式失效（save_instance 后立即见新）/
+    /// config mtime 键失效 / TTL 兜底（未挂钩子的直接写文件，超 TTL 后重算）。
+    /// 变异探针：去掉缓存命中分支 → 「TTL 内不重算」红；去掉写点失效 → 「立即见新」红。
+    #[test]
+    fn legacy_pool_cache_hit_invalidate_ttl() {
+        const CHILD: &str = "AGENTCOCKPIT_LEGACY_POOL_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "proxy::tests::legacy_pool_cache_hit_invalidate_ttl", "--nocapture"])
+                .env("AGENT_COCKPIT_HOME", dir.path()).env(CHILD, dir.path()).status().unwrap();
+            assert!(status.success(), "T7 legacy_pool 缓存子进程测试失败");
+            assert!(dir.path().join("legacy-pool-test-completed").is_file());
+            return;
+        }
+        // ---- 子进程：数据根已重定向 ----
+        // 先初始化保管箱（空库可用），否则 save_instance 的 token 收不进保管箱、
+        // legacy_pool 经 secrets::get 补不回 token，成员清单会是空的。
+        crate::secrets::load();
+        let up = "https://legacy.example";
+        // 建一个带 token 的实例（直接写文件，绕过 save_instance 以测 TTL 兜底）
+        let idir = crate::registry::instances_dir("qoder-cn");
+        std::fs::create_dir_all(&idir).unwrap();
+        let inst = idir.join("账号A.json");
+        std::fs::write(&inst, serde_json::to_string_pretty(&json!({
+            "name": "账号A", "token": "tok-A", "data_dir": idir.to_string_lossy()
+        })).unwrap()).unwrap();
+        // 首次 legacy_pool：真算并回填缓存
+        let first = legacy_pool(up);
+        assert!(first.iter().any(|u| u.token == "tok-A"), "首次应算出账号A");
+        assert!(legacy_pool_cache().lock().unwrap().is_some(), "首次后应有缓存");
+
+        // 同键命中：直接改实例文件 token（绕过写点钩子），TTL 内应仍返回缓存旧值
+        std::fs::write(&inst, serde_json::to_string_pretty(&json!({
+            "name": "账号A", "token": "tok-A-CHANGED", "data_dir": idir.to_string_lossy()
+        })).unwrap()).unwrap();
+        let cached = legacy_pool(up);
+        assert!(cached.iter().any(|u| u.token == "tok-A"), "TTL 内应命中缓存，不重算（T7 回退即红）");
+        assert!(!cached.iter().any(|u| u.token == "tok-A-CHANGED"), "TTL 内不应见到绕过钩子的改动");
+
+        // 写点显式失效：save_instance 后立即见新值
+        let meta = json!({"name": "账号A", "token": "tok-A-NEW", "data_dir": idir.to_string_lossy()});
+        crate::registry::save_instance("qoder-cn", &meta);
+        let after_save = legacy_pool(up);
+        assert!(after_save.iter().any(|u| u.token == "tok-A-NEW"), "save_instance 后必须立即见新值（写点失效漏挂即红）");
+
+        // config mtime 键失效：改 config（sources_off 停用该来源）→ 成员被排除
+        let mut cfg = crate::registry::load_config();
+        let src = crate::gateway::member_src_instance("qoder-cn", "账号A");
+        cfg["proxy"]["sources_off"] = json!([src]);
+        crate::registry::save_config(&cfg);
+        let after_off = legacy_pool(up);
+        assert!(!after_off.iter().any(|u| u.token == "tok-A-NEW"), "停用来源后必须立即排除（config 键失效即红）");
+
+        // TTL 兜底：恢复来源，再绕过钩子直接改文件，等超 TTL 后应重算见到
+        let mut cfg2 = crate::registry::load_config();
+        cfg2["proxy"]["sources_off"] = json!([]);
+        crate::registry::save_config(&cfg2);
+        let _ = legacy_pool(up); // 回填当前缓存
+        std::fs::write(&inst, serde_json::to_string_pretty(&json!({
+            "name": "账号A", "token": "tok-A-TTL", "data_dir": idir.to_string_lossy()
+        })).unwrap()).unwrap();
+        std::thread::sleep(LEGACY_POOL_TTL + std::time::Duration::from_millis(100));
+        let after_ttl = legacy_pool(up);
+        assert!(after_ttl.iter().any(|u| u.token == "tok-A-TTL"), "超 TTL 后必须重算见到绕过钩子的改动（TTL 兜底即红）");
+
+        std::fs::write(crate::registry::base_dir().join("legacy-pool-test-completed"), b"ok").unwrap();
     }
 }

@@ -2,6 +2,9 @@
 (function (root) {
   'use strict';
   const COLORS = ['#679bf5', '#35b68e', '#a37be8', '#e7a354', '#e36c8b', '#42b7c7', '#a3b85b', '#b3937c'];
+  // 图表重建守卫的签名（T10）。声明放在最前：mount() 比 paint() 先定义，
+  // 若把 let 留在 paint 附近，mount 里清签名会撞上暂时性死区。
+  let lastPaintSignature = '';
   const number = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
   const known = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
   const dateKey = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
@@ -286,6 +289,8 @@
     const target = byId('usage-dashboard');
     if (!target || state.mounted) return;
     state.mounted = true;
+    // 新挂载的容器是空的：签名必须清掉，否则数据恰好与上次相同会跳过首次渲染，页面全白。
+    lastPaintSignature = '';
     const tools = dom('div', 'ud-controls');
     tools.append(labelled('时间范围', select('ud-range', [['1', '今天'], ['7', '近 7 天'], ['30', '近 30 天'], ['90', '近 90 天'], ['365', '近一年'], ['all', '全部'], ['custom', '自定义']], state.range, v => { state.range = v; byId('ud-custom').hidden = v !== 'custom'; paint(true); })));
     const custom = dom('div', 'ud-custom'); custom.id = 'ud-custom'; custom.hidden = true;
@@ -606,6 +611,25 @@
     for (const day of [...data.days].reverse()) { const row = dom('tr'); for (const text of [day.date, full(day.exact), full(day.estimated), full(day.tokens)]) row.append(dom('td', '', text)); table.append(row); }
     wrap.append(table); details.append(wrap); return details;
   }
+  /* 图表重建守卫（PERFORMANCE_PLAN T10 / P10）。
+     这一页每 4 秒被 state 带着 paint 一次，另有自己的 30s/2s 轮询；
+     数据没变也把柱状/环形/折线/热力图全部 replaceChildren 重建一遍，纯属白烧。
+     签名覆盖「渲染真正依赖的每一份输入」：数据 + 区间 + 估算开关 + 选中来源。
+     漏一个就会该刷不刷，所以宁可多算几个字段。force=true 一律重建（用户主动操作）。 */
+  function paintSignature(data) {
+    try {
+      // 覆盖**整个 state**，只剔掉与渲染无关的瞬态字段（定时器句柄、进行中标志、桥函数）。
+      // 为什么不挑字段：第一版只列了 range/from/to/app/sourceId/model/includeEstimated，
+      // 漏掉 selectedDate（点图表选点）、dimension、ratios、monitorRange，
+      // 结果 usage-rate-browser 用例点完数据点等不到 .ud-rate-picked——守卫把该刷的吞了。
+      // 整份 state 取签名后，以后新增任何渲染输入都自动纳入，不会再漏。
+      const { timer, pending, bridge, mounted, active, ...renderInputs } = state;
+      return JSON.stringify([renderInputs, data]);
+    } catch {
+      return '';   // 算不出来就当变了，宁可多渲染
+    }
+  }
+
   function paint(force = false) {
     if (!state.mounted || !state.active) return;
     const rootNode = byId('ud-body'), scroller = rootNode.closest('.pagebody'), scrollTop = scroller?.scrollTop || 0;
@@ -617,6 +641,10 @@
     const focusedId = focused && document.activeElement.id;
     const expanded = [...rootNode.querySelectorAll('details[open]')].map(node => node.id);
     const data = current(), metrics = dom('div', 'ud-metrics');
+    // 同一份输入不重建图表；但仍走 updateStatus()，让「更新于几秒前」这类文案照常走字。
+    const signature = paintSignature(data);
+    if (!force && signature !== '' && signature === lastPaintSignature) { updateStatus(); return; }
+    lastPaintSignature = signature;
     const window = rangeWindow(state.range, state.from, state.to);
     const detail = state.includeEstimated ? `实测 ${format(data.exact)} · 估算 ${format(data.estimated)}` : `仅实测 · ${format(data.estimated)} 估算未计入`;
     metrics.append(metric(rangeLabel(state.range), format(data.total), window ? `${window} · ${detail}` : detail, 'ud-metric-primary'),

@@ -8116,14 +8116,19 @@ DOUBAO_COMMON = {
     "pkg_type": "release_version", "device_id": "", "region": "CN", "sys_region": "CN",
     "samantha_web": "1", "web_platform": "desktop", "use-olympus-account": "1",
 }
-def doubao_home(profile=None):
-    """档案目录。换号时驾驶舱把某个账号的 User Data 目录（或它的上级）指过来。"""
+def doubao_home(profile=None, work=False):
+    """档案目录。换号时驾驶舱把某个账号的 User Data 目录（或它的上级）指过来。
+
+    work=True 是「豆包工作（DoubaoWork）」：与豆包同一套 doubao.com 账号体系，
+    但是**两个独立安装**——cookie 各自落在 {LOCALAPPDATA}\\DoubaoWork\\User Data 下，
+    绝不读豆包那份（同 WorkBuddy 国内/国际版的教训）。"""
     if profile:
         p = Path(str(profile))
         if (p / "User Data").exists():
             return p / "User Data"
         return p
-    return Path(os.environ.get("LOCALAPPDATA", "")) / "Doubao" / "User Data"
+    name = "DoubaoWork" if work else "Doubao"
+    return Path(os.environ.get("LOCALAPPDATA", "")) / name / "User Data"
 
 
 def _doubao_secret(blob, aes, host):
@@ -8139,9 +8144,9 @@ def _doubao_secret(blob, aes, host):
     return pt.decode("utf-8", "replace")
 
 
-def doubao_cookie_header(profile=None):
+def doubao_cookie_header(profile=None, work=False):
     """返回 (cookie 串, 来源说明)。读不到就抛 RuntimeError，文案里说清是锁着还是没登录。"""
-    home = doubao_home(profile)
+    home = doubao_home(profile, work)
     db = home / "Default" / "Network" / "Cookies"
     ls_path = home / "Local State"
     if not db.exists():
@@ -8234,13 +8239,13 @@ def doubao_checkin_state(cookie):
     return d, task, ((task or {}).get("daily_checkin") or {})
 
 
-def doubao_credit(profile=None, live=True):
+def doubao_credit(profile=None, live=True, work=False):
     """豆包额度。**厂商没有"剩余额度"接口**——签到活动只给 progress.total_amount（累计获得），
     对话消耗扣在哪一桶、还剩多少，服务端不对外。所以这里只认账号，额度按规矩报 None，
     绝不把"累计获得 1000"当成"还剩 1000"摆出去（那是撒谎）。
     累计值放在 note 里，驾驶舱签到页会显示。"""
     try:
-        cookie, src = doubao_cookie_header(profile)
+        cookie, src = doubao_cookie_header(profile, work)
     except RuntimeError as e:
         return {"error": str(e)}
     info, e1 = _doubao_account(cookie)
@@ -8272,6 +8277,13 @@ def doubao_credit(profile=None, live=True):
     out["live_error"] = (f"签到活动累计获得 {total} 额度；厂商没有剩余额度接口，"
                          "读不到还剩多少") if total is not None else ""
     return out
+
+
+def doubaowork_credit(profile=None, live=True):
+    """豆包工作（DoubaoWork）额度。口径与 doubao_credit 完全一致：同账号体系、
+    同三条 doubao.com 接口，只是登录态取自 DoubaoWork 自己的 User Data。
+    只做额度直读，不做签到领取——那个活动的规则还没在这个产品上核实过。"""
+    return doubao_credit(profile, live, work=True)
 
 
 def ci_doubao(claim=False, profile=None, **_kw):
@@ -8451,6 +8463,8 @@ SERVER_CREDIT_STORES = {
     "raccoon": raccoon_credit,
     # 豆包：只出账号。签到活动只给"累计获得"（progress.total_amount），没有剩余额度接口
     "doubao": doubao_credit,
+    # 豆包工作：同账号体系、独立安装，口径与 doubao 一致（厂商没有剩余额度接口）
+    "doubaowork": doubaowork_credit,
 }
 
 

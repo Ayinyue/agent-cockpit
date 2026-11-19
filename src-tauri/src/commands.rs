@@ -1023,6 +1023,7 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
             if let Some(f) = meta["_file"].as_str() {
                 let _ = std::fs::remove_file(f);
             }
+            crate::proxy::invalidate_legacy_pool(); // T7：删账号后路由成员清单立即重算
             // 兜底：万一上面判断被绕过（例如账号目录刚被别处改名），删完发现默认入口
             // 成了断链，就地摘掉这个链接。留着它，程序连"新建一份档案"的机会都没有。
             let healed = swap::repair_dangling(app_id);

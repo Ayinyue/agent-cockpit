@@ -38,12 +38,22 @@ qrcode = "0.14"
 # 这里显式激活 indexmap/std：build.rs 一见到 CARGO_FEATURE_STD 就直接 emit has_std，跳过探测。
 # （这条依赖代码里并不使用，纯粹为了把 feature 打开）
 indexmap = { version = "1.9", features = ["std"] }
+# T14（阶段四地基）：自研加密原语，为把 agenthub 的 cryptography 解密迁到 Rust 铺路。
+# 本轮只建原语 + golden 测试（合成向量与 python cryptography 逐字节比对），不接任何生产
+# 加解密路径——切换生产 DPAPI/登录态解密属数据丢失级风险，须真实样本 + 单独授权（T15/T16）。
+aes-gcm = "0.10"
+aes = "0.8"
+cbc = "0.1"
+cipher = "0.4"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = "0.12"
+sha2 = "0.10"
 
 # 官网逐资源包额度要驾驶舱自己开窗口登录，登录后从那个 WebView2 的 cookie 罐里取会话
 # （见 webquota.rs）。版本必须和 tauri/wry 用的那条链一致，否则 ICoreWebView2* 类型对不上。
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem", "Win32_Security_Cryptography"] }
 
 [profile.release]
 codegen-units = 1

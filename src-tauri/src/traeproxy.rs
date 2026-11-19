@@ -46,20 +46,20 @@ pub fn app_display(app_id: &str) -> String {
 fn agenthub_json(extra: &[&str]) -> Result<Value, String> {
     let mut args: Vec<&str> = vec!["trae"];
     args.extend_from_slice(extra);
-    let mut c = crate::agenthub::command(&args)?;
-    let out = c
-        .output()
+    let c = crate::agenthub::command(&args)?;
+    // 带超时：反代请求路径上等后端，挂住就是一次永不返回的请求（P7）。
+    let (success, stdout, stderr) = crate::agenthub::output_with_timeout(c)
         .map_err(|e| format!(
             "无法启动内置 Trae 后端：{e}"
         ))?;
-    if !out.status.success() {
-        let s = String::from_utf8_lossy(&out.stderr);
+    if !success {
+        let s = String::from_utf8_lossy(&stderr);
         return Err(format!(
             "Trae 后端失败：{}",
             s.trim().chars().take(180).collect::<String>()
         ));
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("Trae 后端输出不是 JSON：{e}"))
+    serde_json::from_slice(&stdout).map_err(|e| format!("Trae 后端输出不是 JSON：{e}"))
 }
 
 // ───────────────────────── 凭据 ─────────────────────────

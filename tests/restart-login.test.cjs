@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const { chromium } = require('playwright');
+const { launchBrowser } = require('./browser-launch.cjs');
 const root = path.resolve(__dirname, '../ui');
 const evidence = path.resolve(__dirname, '../.agent-sync/layout-evidence');
 const server = http.createServer((req, res) => {
@@ -55,7 +56,7 @@ async function checkConfirmation(page, label) {
   fs.mkdirSync(evidence, { recursive: true });
   let browser;
   try {
-    browser = await chromium.launch({ channel: 'chrome', headless: true });
+    browser = await launchBrowser({});
     for (const [width, height, scale] of [[1320, 920, 100], [960, 850, 125]]) {
       for (const trigger of ['取消本次登录', '关闭']) {
         const page = await browser.newPage({ viewport: { width, height } });

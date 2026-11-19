@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const { chromium } = require('playwright');
+const { launchBrowser } = require('./browser-launch.cjs');
 const root = path.resolve(__dirname, '../ui');
 const server = http.createServer((req, res) => {
   const p = path.resolve(root, '.' + (req.url === '/' ? '/index.html' : req.url.split('?')[0]));
@@ -26,9 +27,12 @@ const cnDate = (s) => `${Number(s.slice(5, 7))}月${Number(s.slice(8, 10))}日`;
 
 (async () => {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const browser = await launchBrowser({});
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+    // 新手引导 600ms 后弹出 .tourmask 拦截指针事件；不屏蔽就是靠「抢在引导出现前点完」的时序运气，
+    // 机器慢一点就恒红。与其余用例同口径：先标记已看过引导。
+    await page.addInitScript(() => localStorage.setItem('cockpit-toured','1'));
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
     await page.waitForFunction(() => typeof S !== 'undefined' && S.data);
 
