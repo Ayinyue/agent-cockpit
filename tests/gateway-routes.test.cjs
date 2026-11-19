@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const {chromium} = require('playwright');
+const { launchBrowser } = require('./browser-launch.cjs');
 const root = path.resolve(__dirname, '../ui');
 const evidence = path.resolve(__dirname, '../.agent-sync/gateway-route-evidence');
 const server = http.createServer((req, res) => {
@@ -20,7 +21,7 @@ const server = http.createServer((req, res) => {
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   let browser;
   try {
-    browser = await chromium.launch({channel:'chrome',headless:true});
+    browser = await launchBrowser({});
     const page = await browser.newPage({viewport:{width:1360,height:1000}});
     const errors=[];
     page.on('pageerror', e => errors.push(e.message));

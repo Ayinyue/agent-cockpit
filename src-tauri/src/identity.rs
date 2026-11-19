@@ -51,14 +51,16 @@ fn count_files(dir: &Path, cap: usize) -> usize {
 /// `.workbuddy-ai`（5247 个）0.29s。每 4 秒重走一遍等于让界面一直泡在磁盘上：
 /// 驾驶舱空载就吃掉三分之一颗核，整机跟着发钝（2026-11-05 她说的"反应还非常慢"）。
 ///
-/// 文件数一分钟内基本不变，缓存 30 秒。真正要即时判断的地方（换号前判"空目录"）
-/// 走 `inspect()` 本体，不经过缓存。
+/// 文件数一分钟内基本不变，缓存 5 分钟（T9，2026-11-19：原 30 秒）。
+/// 前提已核实：本缓存只供状态报文的展示路径（state.rs 的 identity 字段）；
+/// 真正要即时判断的地方（换号前判"空目录" swap.rs、commands.rs 的目录检查）
+/// 走 `inspect()` 本体，不经过缓存——TTL 拉长只影响展示新鲜度，不影响正确性。
 pub fn inspect_cached(data_dir: &str, app_id: &str) -> Identity {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
     static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Identity)>>> = OnceLock::new();
-    const TTL: Duration = Duration::from_secs(30);
+    const TTL: Duration = Duration::from_secs(300);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(g) = cache.lock() {
         if let Some((at, v)) = g.get(data_dir) {
@@ -146,5 +148,41 @@ pub fn inspect(data_dir: &str) -> Identity {
         label,
         files,
         product,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T9：展示缓存 TTL 内第二次调用不得重新 walk 目录。
+    /// 取证手法：第一次调用后把目录改名——若第二次仍返回缓存值（files>0），
+    /// 说明没有重走磁盘；TTL 被改回极短或缓存被绕过时，第二次会看到目录不存在
+    /// 而返回 files=0，本条即红（变异可红）。
+    #[test]
+    fn inspect_cached_serves_cache_within_ttl() {
+        let base = std::env::temp_dir().join(format!(
+            "cockpit-t9-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = base.join("profile");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("auth.json"), b"{}").unwrap();
+        let key = dir.to_string_lossy().to_string();
+        let first = inspect_cached(&key, "codex");
+        assert!(first.files >= 1, "首次应真 walk 出文件");
+        // 目录改名：重走磁盘必然得到「目录尚未创建」(files=0)
+        let moved = base.join("profile-moved");
+        fs::rename(&dir, &moved).unwrap();
+        let second = inspect_cached(&key, "codex");
+        assert_eq!(second.files, first.files, "TTL 内应命中缓存，不得重新 walk（T9 回退即红）");
+        assert_eq!(second.state, first.state);
+        // 对照：不经缓存的 inspect 立刻看到目录已不存在——证明缓存确实挡了一次真 walk
+        assert_eq!(inspect(&key).files, 0);
+        let _ = fs::remove_dir_all(&base);
     }
 }

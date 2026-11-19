@@ -269,6 +269,19 @@ pub fn apps() -> Vec<AppDef> {
             &["{LOCALAPPDATA}/Programs/Doubao/Doubao.exe",
               "{PROGRAMFILES}/Doubao/Doubao.exe"], "",
             Some("{LOCALAPPDATA}/Doubao"), false),
+        // 豆包工作（DoubaoWork，字节 AI 办公桌面版）：与「豆包」是**两个独立安装**——
+        // exe、档案、登录 cookie 都各存各的，绝不能共用候选（同 WorkBuddy 国内/国际版的教训）。
+        // 同为 CEF/Chromium 147 壳：根目录 DoubaoWork.exe 是 1.7MB 启动壳，真主程序在
+        // app\DoubaoWork.exe（5.3MB，与豆包「根壳 + app 主程序」同构）。
+        // 登录态是 doubao.com 会话 cookie，在 {LOCALAPPDATA}\DoubaoWork\User Data\Default\
+        // Network\Cookies（SQLite + os_crypt v10），所以档案目录取 {LOCALAPPDATA}\DoubaoWork
+        // （换号整目录搬）；{APPDATA}\DoubaoWork 只有 public_config.json，与登录无关。
+        // isolatable=false：未实测 --user-data-dir 隔离性，先按仅换号登记。
+        curated("doubaowork", "豆包工作", "electron",
+            &["{PROGRAMFILES}/DoubaoWork/app/DoubaoWork.exe",
+              "{PROGRAMFILES}/DoubaoWork/DoubaoWork.exe",
+              "{LOCALAPPDATA}/Programs/DoubaoWork/app/DoubaoWork.exe"], "",
+            Some("{LOCALAPPDATA}/DoubaoWork"), false),
         curated("cursor", "Cursor", "electron",
             &["{LOCALAPPDATA}/Programs/cursor/Cursor.exe",
               "{LOCALAPPDATA}/Programs/Cursor/Cursor.exe",
@@ -321,6 +334,16 @@ pub fn apps() -> Vec<AppDef> {
             &["{LOCALAPPDATA}/Programs/TRAE SOLO CN/TRAE SOLO CN.exe",
               "{PROGRAMFILES}/TRAE SOLO CN/TRAE SOLO CN.exe"], "",
             Some("{APPDATA}/TRAE SOLO CN"), true),
+        // CodeArts（华为云 IDE，Electron/VS Code 系内核）：product.json 的
+        // nameShort=CodeArts、appId=com.codearts.work，OAuth 走华为云 IAM
+        // （clientId=codearts，region=cn-north-4，tokenRefreshInterval=1h）。
+        // 档案候选 {APPDATA}\CodeArts（Electron 默认 userData）。注意 ~/.codearts 是
+        // 配置/工作区目录（agents/skills/kernel sessions），**不是**登录态，不进候选。
+        // isolatable=false：未实测 --user-data-dir 隔离性，先按仅换号登记。
+        curated("codearts", "CodeArts", "electron",
+            &["{PROGRAMFILES}/CodeArts/CodeArts.exe",
+              "{LOCALAPPDATA}/Programs/CodeArts/CodeArts.exe"], "",
+            Some("{APPDATA}/CodeArts"), false),
     ]
 }
 
@@ -901,6 +924,8 @@ pub fn short_name(app_id: &str) -> &'static str {
         "trae" => "TR",
         "trae-solo" => "TS",
         "trae-solo-cn" => "TS中",
+        "doubaowork" => "DW",
+        "codearts" => "CA",
         _ => "?",
     }
 }
@@ -1666,6 +1691,10 @@ pub fn lockers(app_id: &str) -> &'static [&'static str] {
         // 豆包：主进程和它自己拉起的渲染/GPU/工具进程都叫 Doubao.exe（Chromium 那套
         // --type=xxx 子进程同名），所以只认这一个名字就够。
         "doubao" => &["doubao.exe"],
+        // 豆包工作：与豆包是两个安装，进程名也是自家 DoubaoWork.exe（壳与主程序同名）。
+        "doubaowork" => &["doubaowork.exe"],
+        // CodeArts：Electron 主程序 CodeArts.exe，--type=xxx 子进程同名。
+        "codearts" => &["codearts.exe"],
         _ => &[],
     }
 }
@@ -1850,17 +1879,19 @@ pub fn save_instance_checked(app_id: &str, meta: &Value) -> Result<(), String> {
         if held && crate::secrets::put(&token_id(app_id, name), &token) {
             clean.remove("token");
             clean.insert("token_held".into(), json!(true));
-            let _ = crate::secrets::flush();
+            // T6：批量保存账号时不再逐条起 PowerShell 整包加密——置脏即可，
+            // 后台 ≤5s 合并落盘，退出钩子兜底。单条保存的持久化窗口 ≤5s。
         }
     } else if held {
         clean.remove("token_held");
         crate::secrets::remove(&token_id(app_id, name));
-        let _ = crate::secrets::flush();
+        // T6：同上，remove 已置脏，后台/退出收口。
     }
     let v = Value::Object(clean);
     let path = dir.join(format!("{}.json", name));
     let body = serde_json::to_string_pretty(&v).map_err(|e| format!("账号记录序列化失败：{e}"))?;
     fs::write(&path, body).map_err(|e| format!("写 {} 失败：{e}", path.display()))?;
+    crate::proxy::invalidate_legacy_pool(); // T7：实例变更，路由成员清单立即重算
     Ok(())
 }
 
@@ -1913,15 +1944,66 @@ fn parse_config(text: &str, last_good: Option<&Value>) -> Option<Value> {
 }
 
 pub fn load_config() -> Value {
-    let text = fs::read_to_string(config_file()).unwrap_or_default();
+    // T7：mtime+大小缓存。config.json 是每请求热路径（71 处调用），原先每次都整读+解析。
+    // 缓存键 = (路径, mtime, 大小)：save_config 走「临时文件+rename」原子写，任何保存必然
+    // 改变 mtime/大小 → 键失效自动重读；外部进程改写同样被察觉。单一数据源，无需在 36 个
+    // 写点逐一挂失效钩子。stat 失败/文件不存在 → 键 None，走原读取路径（保留 last_good 兜底）。
+    let path = config_file();
+    let key = config_cache_key(&path);
+    if let Some(k) = &key {
+        if let Ok(g) = config_cache().lock() {
+            if let Some((ck, val)) = g.as_ref() {
+                if ck == k {
+                    return val.clone();
+                }
+            }
+        }
+    }
+    let text = fs::read_to_string(&path).unwrap_or_default();
     let cached = last_good().lock().ok().and_then(|c| c.clone());
     if let Some(v) = parse_config(&text, cached.as_ref()) {
         if let Ok(mut c) = last_good().lock() {
             *c = Some(v.clone());
         }
+        // 只在拿到有效键时回填缓存；键 None（stat 失败）不缓存，下次仍真读。
+        if let Some(k) = key {
+            if let Ok(mut g) = config_cache().lock() {
+                *g = Some((k, v.clone()));
+            }
+        }
         return v;
     }
     json!({"proxy": {"upstream": "https://api.openai.com", "strategy": "round-robin"}})
+}
+
+/// T7 缓存键：(路径, mtime, 大小)。路径入键是为了测试重定向数据根后旧键自然失效。
+type ConfigCacheKey = (PathBuf, std::time::SystemTime, u64);
+
+fn config_cache() -> &'static std::sync::Mutex<Option<(ConfigCacheKey, Value)>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<std::sync::Mutex<Option<(ConfigCacheKey, Value)>>> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn config_cache_key(path: &std::path::Path) -> Option<ConfigCacheKey> {
+    let md = fs::metadata(path).ok()?;
+    let mtime = md.modified().ok()?;
+    Some((path.to_path_buf(), mtime, md.len()))
+}
+
+/// T7：config.json 的 (mtime, 大小) 签名，供 legacy_pool 等下游缓存做键。
+/// 不含路径（下游只关心内容是否变化）；stat 失败返回 None，下游据此不走缓存命中。
+pub fn config_cache_signature() -> Option<(std::time::SystemTime, u64)> {
+    let md = fs::metadata(config_file()).ok()?;
+    Some((md.modified().ok()?, md.len()))
+}
+
+/// T7：写盘成功后主动清缓存。mtime 键本已能自动失效，这里显式清一道，
+/// 防「同一 mtime 粒度内写→读」的极端时序读到旧值；也让测试能确定性验证失效。
+fn invalidate_config_cache() {
+    if let Ok(mut g) = config_cache().lock() {
+        *g = None;
+    }
 }
 
 /// 先写临时文件再改名覆盖：fs::write 会把文件截断，另一边正在读的话
@@ -1940,6 +2022,7 @@ pub fn save_config(cfg: &Value) {
             if let Ok(mut c) = last_good().lock() {
                 *c = Some(cfg.clone());
             }
+            invalidate_config_cache(); // T7：写成功即清缓存，读侧立刻见新值
             return;
         }
         let _ = fs::remove_file(&tmp);
@@ -1949,6 +2032,7 @@ pub fn save_config(cfg: &Value) {
     if let Ok(mut c) = last_good().lock() {
         *c = Some(cfg.clone());
     }
+    invalidate_config_cache(); // T7：兜底直写路径同样清缓存
 }
 
 pub fn swaps_of(cfg: &Value) -> Value {
@@ -2086,6 +2170,78 @@ mod tests {
         // 正常内容原样返回
         let ok = parse_config("{\"a\":1}", Some(&good)).unwrap();
         assert_eq!(ok["a"], json!(1));
+    }
+
+    /// T7 缓存键纯函数：同 mtime+大小 → 同键；任一变化 → 异键。
+    /// 这是「同键命中、键变重读」的判据本身，不碰真文件、无并行污染。
+    /// 变异探针：把键改成只比路径（忽略 mtime/大小），本条即红。
+    #[test]
+    fn config_cache_key_tracks_mtime_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("cfg.json");
+        fs::write(&p, b"{\"a\":1}").unwrap();
+        let k1 = config_cache_key(&p).expect("应取到键");
+        let k2 = config_cache_key(&p).expect("应取到键");
+        assert_eq!(k1, k2, "未改动时键必须稳定（否则每次都重读，缓存失效）");
+        // 大小变化 → 键变
+        fs::write(&p, b"{\"a\":1,\"b\":2}").unwrap();
+        let k3 = config_cache_key(&p).expect("应取到键");
+        assert_ne!(k1.2, k3.2, "大小变了键必须变");
+        // 等长但 mtime 变化 → 键变（sleep 确保 mtime 前进）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&p, b"{\"a\":3,\"b\":4}").unwrap(); // 与上一次等长（13 字节）
+        let k4 = config_cache_key(&p).expect("应取到键");
+        assert_eq!(k3.2, k4.2, "前提：这两次等长");
+        assert_ne!(k3.1, k4.1, "等长改写必须靠 mtime 区分（忽略 mtime 即红）");
+        // 文件不存在 → None（走原读取路径，不缓存）
+        assert!(config_cache_key(&dir.path().join("absent.json")).is_none());
+    }
+
+    /// T7：load_config 的 mtime+大小缓存。在子进程里跑，隔离数据根环境变量与
+    /// 全局缓存静态量，避免和并行 Rust 套件、用户正在跑的驾驶舱互相污染
+    /// （与 gateway::tests::provider_isolated_disk_roundtrip 同一套路）。
+    /// 覆盖：首次真读回填 / save_config 后立即见新值 / 外部改写可察觉 / 半截退回 last_good。
+    /// 变异探针：去掉 save 后的失效钩子，「save 后立即见新值」在 mtime 粒度内即红。
+    #[test]
+    fn config_cache_hit_invalidate_and_external_rewrite() {
+        const CHILD: &str = "AGENTCOCKPIT_CONFIG_CACHE_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "registry::tests::config_cache_hit_invalidate_and_external_rewrite", "--nocapture"])
+                .env("AGENT_COCKPIT_HOME", dir.path()).env(CHILD, dir.path()).status().unwrap();
+            assert!(status.success(), "T7 缓存子进程测试失败");
+            assert!(dir.path().join("config-cache-test-completed").is_file());
+            return;
+        }
+        // ---- 子进程：数据根已被 AGENT_COCKPIT_HOME 重定向到临时目录 ----
+        let cfg_path = config_file();
+        let v1 = json!({"proxy": {"upstream": "https://one.example", "strategy": "round-robin"}, "marker": 1});
+        save_config(&v1);
+        // 首次 load：真读并回填缓存
+        assert_eq!(load_config()["marker"], json!(1));
+        assert!(config_cache().lock().unwrap().is_some(), "首次 load 后应有缓存");
+        // 再读一次：键未变，命中缓存（值一致）
+        assert_eq!(load_config()["marker"], json!(1));
+
+        // save_config 后立即见新值（失效钩子 + mtime 键双保险）
+        let v2 = json!({"proxy": {"upstream": "https://two.example"}, "marker": 2});
+        save_config(&v2);
+        assert_eq!(load_config()["marker"], json!(2), "save 后必须立即读到新值（失效漏写即红）");
+        assert_eq!(load_config()["proxy"]["upstream"], json!("https://two.example"));
+
+        // 外部改写（绕过 save_config 直接写文件）：mtime 变化 → 下次 load 察觉
+        std::thread::sleep(std::time::Duration::from_millis(20)); // 确保 mtime 前进
+        let v3 = json!({"proxy": {"upstream": "https://three.example"}, "marker": 3});
+        fs::write(&cfg_path, serde_json::to_string_pretty(&v3).unwrap()).unwrap();
+        assert_eq!(load_config()["marker"], json!(3), "外部改写必须被 mtime 键察觉（T7 回退即红）");
+
+        // 半截文件：退回 last_good（上一份好数据 v3），不退回空默认
+        fs::write(&cfg_path, "{\"proxy\":").unwrap();
+        let got = load_config();
+        assert_eq!(got["marker"], json!(3), "半截文件应退回上一份好数据");
+
+        fs::write(config_file().parent().unwrap().join("config-cache-test-completed"), b"ok").unwrap();
     }
 
     /// 商汤小浣熊：档案候选是 `~/.office-raccoon` 与 mac/linux 那层 `office-raccoon`，
@@ -2548,13 +2704,42 @@ mod tests {
             || p.to_string_lossy().ends_with("AppData/Roaming/Qoder"), "实际：{p:?}");
 
         let q = app_def("qoder").expect("qoder 该在 curated 里");
-        assert_eq!(q.profile.as_deref(), Some("{APPDATA}/com.qoder.app.stable|{APPDATA}/Qoder"));
-        // 0.4.x 新壳的目录里就有 auth.v1.dat，所以解析结果是它
-        let d = profile_dir("qoder").unwrap();
-        assert_eq!(d, PathBuf::from(&ad).join("com.qoder.app.stable"));
+        let spec = q.profile.as_deref().expect("qoder 该有 profile 候选");
+        assert_eq!(spec, "{APPDATA}/com.qoder.app.stable|{APPDATA}/Qoder");
+        // 两个候选都必须展开成 %APPDATA% 下的绝对路径，且新壳排在前面。
+        // 这里只验「模板展开 + 候选顺序」这份契约，不碰本机真实登录态。
+        let expanded: Vec<PathBuf> = spec.split('|').map(one_profile).collect();
+        assert_eq!(expanded[0], PathBuf::from(&ad).join("com.qoder.app.stable"));
+        assert_eq!(expanded[1], PathBuf::from(&ad).join("Qoder"));
         // 一定不能是 ~/.qoder（那是 agent 运行时家目录，换它既无效又被占）
-        assert_ne!(d, home().join(".qoder"));
-        assert!(!d.components().any(|c| c.as_os_str() == ".qoder"));
+        for d in &expanded {
+            assert_ne!(d, &home().join(".qoder"));
+            assert!(!d.components().any(|c| c.as_os_str() == ".qoder"));
+        }
+
+        // 「挑哪个候选」由 resolve_profile_in 决定，用注入目录测，**不读本机 %APPDATA%**。
+        // 原先这里直接调 profile_dir("qoder") 并断言等于新壳目录：那等于要求
+        // 每台开发机都必须登录过 0.4.x 新壳。本机旧壳留着 state.vscdb、新壳没有
+        // auth.v1.dat 时，产品按「真有登录数据」正确选中旧壳，测试却恒红（2026-11-18 实测）。
+        // 期望值只能来自注入的 fixture，不能来自真实机器状态。
+        let tmp = std::env::temp_dir().join("cockpit-qoder-appdata-template-test");
+        let _ = fs::remove_dir_all(&tmp);
+        let instances = tmp.join("instances");
+        let new_shell = tmp.join("com.qoder.app.stable");
+        let legacy = tmp.join("Qoder");
+        fs::create_dir_all(&new_shell).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        let injected = format!("{}|{}", new_shell.to_string_lossy(), legacy.to_string_lossy());
+        // 新壳有 auth.v1.dat → 选新壳（0.4.x 的正常情形）
+        fs::write(new_shell.join("auth.v1.dat"), b"v10xx").unwrap();
+        assert_eq!(resolve_profile_in(&injected, &instances).as_deref(), Some(new_shell.as_path()));
+        // 只有旧壳留着登录痕迹 → 选旧壳，这正是本机当时的状态，属正确行为
+        fs::remove_file(new_shell.join("auth.v1.dat")).unwrap();
+        fs::create_dir_all(legacy.join("User").join("globalStorage")).unwrap();
+        fs::write(legacy.join("Local State"), "{}").unwrap();
+        fs::write(legacy.join("User").join("globalStorage").join("state.vscdb"), "").unwrap();
+        assert_eq!(resolve_profile_in(&injected, &instances).as_deref(), Some(legacy.as_path()));
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     /// `~/.qoder` 不是可换号的登录档案，要能被认出来并拦住

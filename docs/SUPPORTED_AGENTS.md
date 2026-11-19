@@ -32,6 +32,13 @@
 | 商汤小浣熊 | Electron | 换号 | ✅ | — |
 | CodeBuddy | Electron | 多开 | — | — |
 | CodeBuddy CN | Electron | 多开 | — | — |
+| 豆包工作（DoubaoWork） | Electron | 换号 | 身份 | — |
+| CodeArts（华为云 IDE） | Electron | 换号 | — | — |
+
+> 豆包工作已接额度直读（2026-11-18 实测）：登录态是 doubao.com 会话 cookie，取自
+> `{LOCALAPPDATA}\DoubaoWork\User Data`（与豆包是两个独立安装，各读各的）。
+> 口径与豆包一致——厂商没有"剩余额度"接口，只能认出账号与签到活动累计，
+> 所以那一列是**身份**而不是 ✅。CodeArts 仍只登记隔离（换号），额度直读尚未实现。
 
 ## 国际产品
 

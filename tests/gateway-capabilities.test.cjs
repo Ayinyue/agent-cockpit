@@ -3,6 +3,7 @@ const fs=require('node:fs');
 const path=require('node:path');
 const http=require('node:http');
 const {chromium}=require('playwright');
+const { launchBrowser } = require('./browser-launch.cjs');
 const root=path.resolve(__dirname,'..');
 
 /* The supplier page keeps UI state in localStorage, so the harness needs a real
@@ -14,9 +15,11 @@ const server=http.createServer((req,res)=>{res.setHeader('Content-Type','text/ht
    (模型反代 → 供应商 → 详情). The Agent page panel only points there. */
 
 (async()=>{
-  const browser=await chromium.launch({channel:'chrome',headless:true});
+  const browser=await launchBrowser({});
   try{
     const page=await browser.newPage({viewport:{width:1280,height:1000}});
+    // 同其余用例：屏蔽新手引导，否则 .tourmask 会挡住供应商页的「设置模型」入口。
+    await page.addInitScript(() => localStorage.setItem('cockpit-toured','1'));
     const errors=[];page.on('pageerror',e=>errors.push(e.message));
     await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
     await page.goto('http://127.0.0.1:'+server.address().port+'/',{waitUntil:'domcontentloaded'});
@@ -76,14 +79,37 @@ const server=http.createServer((req,res)=>{res.setHeader('Content-Type','text/ht
     await page.evaluate(async()=>{
       window.page=gatewaySuppliers.create($('suppliers'),{id:'workbuddy'});
       window.page.load();
-      await new Promise(r=>setTimeout(r,60));
-      window.page.paint();
+      // 别赌固定 60ms：模型目录是异步 invoke 回来的，慢一点就 paint 出空目录，
+      // 「设置模型」选择器根本不渲染（details.length 为 0 时走空态分支）。
+      // 等「模型真的到手」这个条件成立再 paint，与项目的滚动护栏同一条纪律。
+      const deadline=Date.now()+5000;
+      while(Date.now()<deadline){
+        window.page.paint();
+        if($('suppliers').querySelector('.gateway-supplier-row')) break;
+        await new Promise(r=>setTimeout(r,20));
+      }
     });
-    const panel=page.locator('#suppliers');
-    await panel.locator('.gateway-supplier-row').click();
-    await panel.getByLabel('设置模型',{exact:true}).waitFor();
+    // 详情面板是 <dialog>，由 gateway-suppliers.js:253 `document.body.append(dialog)` 挂到 body，
+    // **不在 #suppliers 子树里**。原先用 panel(=#suppliers) 去找「设置模型」永远等不到（超时 30s）。
+    // 供应商行仍在 #suppliers 内，详情控件一律用 dialog 作用域。
+    const list = page.locator('#suppliers');
+    const panel = page.locator('dialog.gateway-supplier-settings');
+    await list.locator('.gateway-supplier-row').click();
+    await panel.waitFor();
+    // 模型目录是异步 invoke 回来的：等「选择器真的渲染」而不是赌固定毫秒数。
+    // paint 由真实界面的轮询驱动，测试里要自己推一下让异步结果落地。
+    const settleModels = async () => {
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        await page.evaluate(() => window.page.paint());
+        if (await panel.getByLabel('设置模型', { exact: true }).count()) return;
+        await page.waitForTimeout(25);
+      }
+      throw new Error('模型选择器未渲染：模型目录未取回或未选中接入密钥');
+    };
+    await settleModels();
     await panel.getByLabel('接入密钥',{exact:true}).selectOption({index:1});
-    await panel.getByLabel('设置模型',{exact:true}).waitFor();
+    await settleModels();
 
     for(const label of ['图片输入','上下文窗口','最大输出','压缩阈值','推理思考','每个账号的并发上限','价格倍率'])
       assert.ok(await panel.getByLabel(label,{exact:true}).isVisible(),label+' must be present');
@@ -140,6 +166,10 @@ const server=http.createServer((req,res)=>{res.setHeader('Content-Type','text/ht
     assert.deepEqual(rule,{concurrency:2,accounts:1,rpm:30,queue_limit:8,queue_wait:20,fallbacks:['pool:backup','opencode/text'],
       order:'cheapest',multiplier:0.8,free:true,periods:[{start:'22:00',end:'06:00',factor:1.5,days:[7]}]});
 
+    // 供应商设置是 modal dialog，showModal 后它覆盖整页并拦截指针事件。
+    // 定价面板挂在 #pricing（dialog 之外），必须先关掉这个 modal 才点得到。
+    await panel.getByRole('button',{name:'关闭',exact:true}).click();
+    await panel.waitFor({state:'detached'});
     await page.evaluate(()=>{
       window.pricing=gatewayProvider.create((op,fields)=>window.__TAURI__.core.invoke('client_gateway',{op,...fields}));
       $('pricing').append(window.pricing.render({model:'trae/eye',scope:'model',keyId:'primary',models:window.models}));
@@ -157,7 +187,8 @@ const server=http.createServer((req,res)=>{res.setHeader('Content-Type','text/ht
 
     const evidence=path.join(root,'.agent-sync','gateway-ui-evidence');
     fs.mkdirSync(evidence,{recursive:true});
-    await panel.screenshot({path:path.join(evidence,'supplier-settings.png'),fullPage:true});
+    // dialog 已关闭，留证照改拍定价面板（原来拍已 detach 的 dialog 会失败）
+    await pricing.screenshot({path:path.join(evidence,'supplier-settings.png'),fullPage:true});
     assert.deepEqual(errors,[]);
     console.log(JSON.stringify({result:'PASS',checks:'capability inheritance, native transport, token parsing, reasoning levels, provider rules, price payload, draft preservation',evidence}));
   } finally {await browser.close();await new Promise(resolve=>server.close(resolve));}

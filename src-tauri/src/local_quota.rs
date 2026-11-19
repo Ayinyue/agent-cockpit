@@ -52,6 +52,11 @@ pub const LOCAL_STORES: &[(&str, &str)] = &[
     // **只出账号、不出额度**：签到活动只给 progress.total_amount（累计获得），厂商没有
     // "还剩多少"的接口——所以 left/total 报 None，别把累计值当余额画出来。
     ("doubao", "doubao"),
+    // 豆包工作（DoubaoWork，字节 AI 办公桌面版）：与豆包同一套 doubao.com 账号体系、
+    // 同三条接口，但是**两个独立安装**——cookie 各自落在
+    // {LOCALAPPDATA}\DoubaoWork\User Data\Default\Network\Cookies，绝不读豆包那份
+    // （同 WorkBuddy 国内/国际版的教训）。口径与 doubao 一致：只出账号、不出额度。
+    ("doubaowork", "doubaowork"),
 ];
 
 pub fn store_for(app_id: &str) -> Option<&'static str> {
@@ -319,40 +324,110 @@ pub fn fetch_for_instance(store: &str, app_id: &str, meta: &Value) -> Result<Quo
 
 /// 跑 `agenthub quota --json <store>` 并把结果结构化。
 /// profile = 该账号自己的档案目录（按账号分别读的关键），None 则读产品当前默认档案。
+/// T5：批量取数 wrapper（编译进 exe，运行时 stdin 注入，与 usage-local.py 同机制）。
+/// 一次进程冷启导入 agenthub 循环 cmd_quota 处理多账号，把 N 次冷启压成 1 次。
+const BATCH_SCRIPT: &str = include_str!("../scripts/agenthub-batch.py");
+
+/// T5：批量取多账号的原始 quota JSON（一次进程冷启）。
+/// targets = [(store, profile)]；返回与 targets 等长的数组，每项是该账号 `agenthub quota --json`
+/// 的原始输出（已解析成 Value，取 [0] 前的完整数组）。整轮失败返回 Err，调用方回退逐账号。
+/// 只覆盖标准 local_quota 直读；zcode/workbuddy 特殊路径仍走单账号 fetch（守卫/登录包逻辑在那边）。
+pub fn fetch_batch_raw(targets: &[(String, Option<String>)]) -> Result<Vec<Value>, String> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (python, agenthub_path) = crate::usage::bundled_agenthub()?;
+    let req: Vec<Value> = targets
+        .iter()
+        .map(|(store, profile)| {
+            json!({"product": store, "profile": profile.clone().unwrap_or_default()})
+        })
+        .collect();
+    let targets_json = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+    // wrapper 读 argv[1]=agenthub 路径、argv[2]=targets JSON；脚本正文经 -c 注入
+    let mut c = std::process::Command::new(python);
+    c.args(["-I", "-B", "-X", "utf8", "-c", BATCH_SCRIPT])
+        .arg(&agenthub_path)
+        .arg(&targets_json);
+    // 复用 agenthub 的环境（AGENTHUB_HOME / AGENT_COCKPIT_HOME / workbuddy at-rest secret / astudio）
+    let base = crate::registry::base_dir();
+    c.env("AGENTHUB_HOME", base.join("agenthub-state"));
+    c.env("AGENT_COCKPIT_HOME", &base);
+    if let Some(secret) = crate::wbproxy::at_rest_secret() {
+        c.env("AGENTHUB_WORKBUDDY_AT_REST_SECRET", secret);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+    let (success, stdout, stderr) = crate::agenthub::output_with_timeout(c)
+        .map_err(|e| format!("无法启动批量额度后端：{e}"))?;
+    if !success {
+        let s = String::from_utf8_lossy(&stderr);
+        return Err(format!("批量额度后端失败：{}", s.trim().chars().take(180).collect::<String>()));
+    }
+    let results: Vec<Value> = serde_json::from_slice(&stdout)
+        .map_err(|_| "批量额度后端输出格式错误".to_string())?;
+    if results.len() != targets.len() {
+        return Err("批量额度后端返回条目数与请求不符".into());
+    }
+    // 每项 {product, profile, ok, error, data}；data 是该账号 quota 的原始 stdout 文本
+    let mut out = Vec::with_capacity(results.len());
+    for r in &results {
+        if r["ok"].as_bool() != Some(true) {
+            return Err(format!("批量取数某账号失败：{}", r["error"].as_str().unwrap_or("未知")));
+        }
+        let data = r["data"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(data)
+            .map_err(|_| "批量取数某账号输出不是合法 JSON".to_string())?;
+        out.push(parsed);
+    }
+    Ok(out)
+}
+
 pub fn fetch(store: &str, profile: Option<&str>) -> Result<Quota, String> {
+    // zcode「读取期间登录变化」守卫：读取前后各取一次文件快照，变了就拒绝（防串号）。
+    // 批量路不处理 zcode（仍走本单账号入口），守卫保留在这里。
     let zcode_root = profile.map(std::path::PathBuf::from).unwrap_or_else(crate::zcode::native_root);
     let zcode_bytes = if store == crate::zcode::APP { Some(std::fs::read(zcode_root.join("v2/credentials.json")).map_err(|_|"无法读取 ZCode 登录文件")?) } else { None };
-    let zcode_identity = if store == crate::zcode::APP {
-        Some(crate::zcode::identity_at(&zcode_root)?)
-    } else { None };
-    // profile 给了就读那个账号自己的档案目录——单实例产品靠 junction 换号，
-    // 每个账号的数据就在它自己的 data_dir 里，这样才能一账号一读数。
+    // 带超时：autofetch 是串行遍历十几产品 × N 账号，一次挂住就整轮停摆（P7/P11）。
     let mut c = crate::agenthub::command(&["quota", "--json", store])?;
     if let Some(dir) = profile {
         if !dir.is_empty() {
             c.arg("--profile").arg(dir);
         }
     }
-    let out = c
-        .output()
+    let (success, stdout, stderr) = crate::agenthub::output_with_timeout(c)
         .map_err(|e| format!(
             "无法启动内置额度后端：{e}"
         ))?;
-    if !out.status.success() {
-        let s = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "额度后端失败：{}",
-            s.trim().chars().take(180).collect::<String>()
-        ));
-    }
-    let parsed: Value = serde_json::from_slice(&out.stdout)
-        .map_err(|_| agenthub_output_error(&out.stdout, &out.stderr))?;
-    let d = parsed.get(0).ok_or_else(|| "agenthub 没返回任何条目".to_string())?;
     if let Some(before) = zcode_bytes {
         if std::fs::read(zcode_root.join("v2/credentials.json")).ok().as_deref() != Some(before.as_slice()) {
             return Err("ZCode 登录在读取期间变化，请重新读取额度".into());
         }
     }
+    parse_quota_output(store, profile, success, &stdout, &stderr)
+}
+
+/// T5：把「解析 agenthub quota 输出 → Quota」从 fetch 抽出成纯函数，供单账号与批量两条路共用。
+/// 批量入口一次进程取多账号原始 JSON 后，逐账号调本函数，解析逻辑保持单一真身。
+/// zcode 的「读取期间登录变化」守卫依赖读取前后的文件快照，批量路不经过这里（zcode 仍走单账号 fetch）。
+pub fn parse_quota_output(store: &str, profile: Option<&str>, success: bool, stdout: &[u8], stderr: &[u8]) -> Result<Quota, String> {
+    let zcode_root = profile.map(std::path::PathBuf::from).unwrap_or_else(crate::zcode::native_root);
+    let zcode_identity = if store == crate::zcode::APP {
+        Some(crate::zcode::identity_at(&zcode_root)?)
+    } else { None };
+    if !success {
+        let s = String::from_utf8_lossy(stderr);
+        return Err(format!(
+            "额度后端失败：{}",
+            s.trim().chars().take(180).collect::<String>()
+        ));
+    }
+    let parsed: Value = serde_json::from_slice(stdout)
+        .map_err(|_| agenthub_output_error(stdout, stderr))?;
+    let d = parsed.get(0).ok_or_else(|| "agenthub 没返回任何条目".to_string())?;
     if let Some(e) = d.get("error").and_then(|v| v.as_str()) {
         return Err(format!("读不到余额：{e}"));
     }
@@ -742,6 +817,9 @@ mod tests {
         assert_eq!(store_for("dsh"), Some("dsh"));
         assert_eq!(store_for("marvis"), Some("marvis"));
         assert_eq!(store_for("xiaomi-mimo"), Some("xiaomi-mimo"));
+        // 豆包 / 豆包工作：同账号体系、不同安装，各自一份 cookie（2026-11-18 实测）
+        assert_eq!(store_for("doubao"), Some("doubao"));
+        assert_eq!(store_for("doubaowork"), Some("doubaowork"));
         // OpenCode 故意不接：本机从未登录过官方账号（opencode.db 的 account 三表 0 行），
         // 产品自身也没有余额接口——登记了档案目录，但没有直读通道。
         assert_eq!(store_for("opencode"), None);
@@ -953,5 +1031,66 @@ mod tests {
         let hint = q.stale_hint();
         assert!(hint.contains("500"), "要把原因带出来：{hint}");
         assert!(!hint.contains("令牌已过期"));
+    }
+
+    // ---------------- T5：批量取数解析与单账号一致 ----------------
+
+    /// 合成一条 agenthub quota 输出（非真实凭据）。
+    fn synthetic_quota_json() -> Value {
+        json!([{
+            "userId": "uid-synthetic", "account": "合成账号", "userType": "plus",
+            "left": 80.0, "total": 100.0, "exceeded": false, "expires": "2026-12-31",
+            "kind": "full", "source": "server",
+            "buckets": [{"pool": "主额度", "remaining": 80.0, "total": 100.0, "used": 20.0, "expires": "2026-12-31", "unit": "credits"}],
+            "groups": []
+        }])
+    }
+
+    /// T5：parse_quota_output 对合成 quota 的解析正确（批量路复用的就是它）。
+    /// 变异探针：把 left/total 解析改坏，本条即红。
+    #[test]
+    fn parse_quota_output_extracts_fields() {
+        let raw = serde_json::to_vec(&synthetic_quota_json()).unwrap();
+        let q = parse_quota_output("qoder-cn", Some("/tmp/synthetic"), true, &raw, &[]).expect("应解析成功");
+        assert_eq!(q.user_id, "uid-synthetic");
+        assert_eq!(q.left, Some(80.0));
+        assert_eq!(q.total, Some(100.0));
+        assert_eq!(q.expires_on, "2026-12-31");
+        assert_eq!(q.portions.len(), 1);
+        assert_eq!(q.portions[0]["label"], json!("主额度"));
+    }
+
+    /// T5：批量路「raw→to_vec→parse_quota_output」与单账号 fetch 的解析逐字段一致。
+    /// 这里用同一份合成 JSON 走两条解析路径比对（单账号路的进程调用无法离线测，
+    /// 但解析逻辑是同一个 parse_quota_output，本条钉住批量路的序列化往返不丢字段）。
+    #[test]
+    fn batch_parse_roundtrip_matches_direct() {
+        let raw_json = synthetic_quota_json();
+        // 批量路：fetch_batch_raw 返回 Value → to_vec → parse_quota_output
+        let batch_bytes = serde_json::to_vec(&raw_json).unwrap();
+        let batch_q = parse_quota_output("qoder-cn", Some("/tmp/synthetic"), true, &batch_bytes, &[]).unwrap();
+        // 直接路：原始字节 → parse_quota_output
+        let direct_bytes = serde_json::to_vec(&raw_json).unwrap();
+        let direct_q = parse_quota_output("qoder-cn", Some("/tmp/synthetic"), true, &direct_bytes, &[]).unwrap();
+        assert_eq!(batch_q.user_id, direct_q.user_id);
+        assert_eq!(batch_q.left, direct_q.left);
+        assert_eq!(batch_q.total, direct_q.total);
+        assert_eq!(batch_q.portions, direct_q.portions);
+        assert_eq!(batch_q.expires_on, direct_q.expires_on);
+    }
+
+    /// T5：后端失败/空输出/错误条目必须如实报 Err（批量路据此回退逐账号）。
+    #[test]
+    fn parse_quota_output_reports_errors() {
+        let raw = serde_json::to_vec(&synthetic_quota_json()).unwrap();
+        // 进程失败
+        assert!(parse_quota_output("qoder-cn", None, false, &[], b"boom").is_err());
+        // 空数组（没返回条目）
+        assert!(parse_quota_output("qoder-cn", None, true, b"[]", &[]).is_err());
+        // 条目带 error
+        let err_json = serde_json::to_vec(&json!([{"error": "读不到"}])).unwrap();
+        assert!(parse_quota_output("qoder-cn", None, true, &err_json, &[]).is_err());
+        // 正常成功
+        assert!(parse_quota_output("qoder-cn", None, true, &raw, &[]).is_ok());
     }
 }

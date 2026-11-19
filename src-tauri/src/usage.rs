@@ -50,9 +50,22 @@ pub fn collect(app_id: &str, data_dir: &str) -> Option<Value> {
     collect_with_error(app_id, data_dir).ok().flatten()
 }
 
+/// 带逐条记录的采集：只有用量看板的跨账号去重需要它。
+/// 其余消费点（账号卡片 compute / 波形图 compute_trend）一律走不带记录的轻包——
+/// 实测同一源整包 7.04 MB 里 6.96 MB 是 `_records`（98.9%），序列化 213 ms → 2.5 ms。
+pub fn collect_with_records(app_id: &str, data_dir: &str) -> CollectResult {
+    collect_inner(app_id, data_dir, true)
+}
+
 /// Distinguish unavailable runtime, inaccessible data, timeout and empty history.
 /// Diagnostic messages never expose paths, credentials or conversation text.
 pub fn collect_with_error(app_id: &str, data_dir: &str) -> CollectResult {
+    collect_inner(app_id, data_dir, false)
+}
+
+/// `with_records` 必须进缓存键：轻包与全包是两种不同的返回形态，
+/// 共用一个键会让看板拿到没有 `_records` 的缓存，去重直接失效（静默错账）。
+fn collect_inner(app_id: &str, data_dir: &str, with_records: bool) -> CollectResult {
     if !supported(app_id) || data_dir.trim().is_empty() { return Ok(None); }
     let path = Path::new(data_dir);
     match std::fs::metadata(path) {
@@ -62,8 +75,8 @@ pub fn collect_with_error(app_id: &str, data_dir: &str) -> CollectResult {
         Err(_) => return Err("无法访问本地用量目录，请检查权限。".into()),
     }
     let path = path.canonicalize().map_err(|_| "无法解析本地用量目录。".to_string())?;
-    let key = format!("{}|{}", app_id, path.to_string_lossy().to_lowercase());
-    cached_source(key, || run_helper(app_id, &path))
+    let key = format!("{}|{}|{}", app_id, path.to_string_lossy().to_lowercase(), with_records);
+    cached_source(key, || run_helper(app_id, &path, with_records))
 }
 
 fn cached_source(key: String, fetch: impl FnOnce() -> CollectResult) -> CollectResult {
@@ -308,7 +321,7 @@ fn bundled_python_at(base: &Path, runtime: &Mutex<Option<(PathBuf, PathBuf)>>) -
     Ok(path)
 }
 
-fn run_helper(app_id: &str, data_dir: &Path) -> CollectResult {
+fn run_helper(app_id: &str, data_dir: &Path, with_records: bool) -> CollectResult {
     let mut command = Command::new(bundled_python()?);
     command.args(["-I", "-B", "-X", "utf8", "-c", BOOTSTRAP])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
@@ -326,7 +339,7 @@ fn run_helper(app_id: &str, data_dir: &Path) -> CollectResult {
         Some(bytes)
     });
     let request = json!({"script":SCRIPT,"request":{
-        "app_id":app_id,"data_dir":data_dir,
+        "app_id":app_id,"data_dir":data_dir,"with_records":with_records,
         "cache_dir":crate::registry::base_dir().join("usage-cache")
     }}).to_string();
     let written = child.stdin.take().map(|mut input| input.write_all(request.as_bytes()).is_ok()).unwrap_or(false);
@@ -353,7 +366,15 @@ fn run_helper(app_id: &str, data_dir: &Path) -> CollectResult {
 /// Legacy summary used on account cards, derived from the same de-duplicated
 /// events as the statistics page (cache reads are not added twice).
 pub fn compute(app_id: &str, data_dir: &str) -> Option<Value> {
-    let value = collect(app_id, data_dir)?;
+    summary_from(&collect(app_id, data_dir)?)
+}
+
+pub fn compute_trend(app_id: &str, data_dir: &str) -> Option<Value> {
+    trend_from(collect(app_id, data_dir)?)
+}
+
+/// T1：账号卡片汇总视图（从 compute 抽出的纯函数）。total<=0 视为无用量（None≠0 契约）。
+fn summary_from(value: &Value) -> Option<Value> {
     if value["total"].as_f64().unwrap_or(0.0) <= 0.0 { return None; }
     Some(json!({"input":value["input_tokens"],"output":value["output_tokens"],
         "cached":value["cached_tokens"],"reasoning":0,"total":value["total"],
@@ -362,11 +383,23 @@ pub fn compute(app_id: &str, data_dir: &str) -> Option<Value> {
         "coverage":value["coverage"]}))
 }
 
-pub fn compute_trend(app_id: &str, data_dir: &str) -> Option<Value> {
-    let mut value = collect(app_id, data_dir)?;
+/// T1：按天序列视图（从 compute_trend 抽出的纯函数）。days 空返 None。
+/// collect 已是轻包（不含 _records）；这里仍显式移除一次，
+/// 保证即使上游改回全包也不会有逐条记录漏进前端。
+fn trend_from(mut value: Value) -> Option<Value> {
     value["days"].as_array().filter(|days| !days.is_empty())?;
     value.as_object_mut()?.remove("_records");
     Some(value)
+}
+
+/// T1：后台相邻消费专用——一次采集派生汇总与按天序列两视图，省掉第二次 collect 的
+/// 缓存克隆与重复包装。两视图独立判空：汇总为 None（total<=0）不吞掉可能非空的 trend，
+/// 反之亦然，与旧双调用语义逐点一致。summary_from 借用、trend_from 取所有权，零额外克隆。
+pub fn compute_pair(app_id: &str, data_dir: &str) -> (Option<Value>, Option<Value>) {
+    match collect(app_id, data_dir) {
+        Some(v) => (summary_from(&v), trend_from(v)),
+        None => (None, None),
+    }
 }
 
 #[cfg(test)]
@@ -644,5 +677,71 @@ mod tests {
         assert_eq!(t["source"], "本机 Claude Code 会话日志");
         // 没日志的产物：整块不出现，不摆空图
         assert!(compute_trend("claude", dir.join("missing").to_string_lossy().as_ref()).is_none());
+    }
+
+    // ---------------- T1：compute_pair 单采集派生两视图 ----------------
+
+    /// T1：同一 fixture 下 compute_pair 的两视图与 compute/compute_trend 输出逐字段相等。
+    /// 变异探针：把 summary_from/trend_from 的字段挑错，本条即红。
+    #[test]
+    fn pair_matches_legacy_views() {
+        let Some(profile) = isolated_usage_profile() else { return };
+        let dir = profile.path();
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let f = sessions.join("rollout.jsonl");
+        fs::write(&f, concat!(
+            r#"{"type":"session_meta","payload":{}}"#, "\n",
+            r#"{"type":"event_msg","timestamp":"2026-05-27T06:07:18.088Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":70},"total_token_usage":{"input_tokens":60,"cached_input_tokens":5,"output_tokens":10,"reasoning_output_tokens":2,"total_tokens":70}}}}"#, "\n",
+            r#"{"type":"event_msg","timestamp":"2026-05-27T07:00:00.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":80},"total_token_usage":{"input_tokens":130,"cached_input_tokens":10,"output_tokens":20,"reasoning_output_tokens":4,"total_tokens":150}}}}"#,
+        )).unwrap();
+        let d = dir.to_string_lossy();
+        let (pu, pt) = compute_pair("codex", &d);
+        let lu = compute("codex", &d);
+        let lt = compute_trend("codex", &d);
+        assert_eq!(pu, lu, "汇总视图必须与旧 compute 逐字段相等（T1 回退即红）");
+        assert_eq!(pt, lt, "按天视图必须与旧 compute_trend 逐字段相等（T1 回退即红）");
+        assert!(pu.is_some() && pt.is_some(), "有数据时两视图都应非空");
+    }
+
+    /// T1：两视图独立判空——total<=0 不吞掉可能非空的 trend，days 空不吞掉汇总。
+    /// 直接对纯函数喂构造 Value（collect 对空聚合返 None，无法自然构造 total=0 整包）。
+    /// 变异探针：把 compute_pair 改成「汇总 None 则 trend 也 None」，本条即红。
+    #[test]
+    fn pair_views_judge_none_independently() {
+        // total=0 但 days 非空：汇总 None，trend 仍 Some
+        let v = json!({"total":0,"input_tokens":0,"output_tokens":0,"cached_tokens":0,
+            "files":1,"exact_tokens":0,"estimated_tokens":0,"source":"s","coverage":"c",
+            "days":[{"date":"2026-05-27","credits":0,"sessions":1}]});
+        assert!(summary_from(&v).is_none(), "total<=0 汇总应 None");
+        assert!(trend_from(v.clone()).is_some(), "days 非空 trend 应 Some，不被汇总吞掉");
+        // total>0 但 days 空：汇总 Some，trend None
+        let v2 = json!({"total":100,"input_tokens":80,"output_tokens":20,"cached_tokens":0,
+            "files":1,"exact_tokens":100,"estimated_tokens":0,"source":"s","coverage":"c","days":[]});
+        assert!(summary_from(&v2).is_some(), "total>0 汇总应 Some");
+        assert!(trend_from(v2).is_none(), "days 空 trend 应 None，不被汇总吞掉");
+    }
+
+    /// T1：trend_from 必须剔除 _records（防上游改回全包时逐条记录漏进前端）。
+    /// 变异探针：删掉 remove("_records") 行，本条即红。
+    #[test]
+    fn pair_trend_never_leaks_records() {
+        let v = json!({"total":100,"days":[{"date":"2026-05-27","credits":100,"sessions":1}],
+            "_records":[{"tokens":100,"date":"2026-05-27"}]});
+        let t = trend_from(v).expect("days 非空应 Some");
+        assert!(t.get("_records").is_none(), "_records 必须被剔除（T1 回退即红）");
+        assert!(t["days"].is_array(), "days 应保留");
+    }
+
+    /// T1：两视图是独立对象——改 summary 不影响 trend（所有权分离，防共享引用回归）。
+    #[test]
+    fn pair_views_are_independent_objects() {
+        let v = json!({"total":100,"input_tokens":80,"output_tokens":20,"cached_tokens":0,
+            "files":1,"exact_tokens":100,"estimated_tokens":0,"source":"s","coverage":"c",
+            "days":[{"date":"2026-05-27","credits":100,"sessions":1}]});
+        let mut s = summary_from(&v).unwrap();
+        let t = trend_from(v).unwrap();
+        s["total"] = json!(999); // 改汇总
+        assert_eq!(t["total"].as_f64(), Some(100.0), "改 summary 不应影响 trend（所有权独立）");
     }
 }

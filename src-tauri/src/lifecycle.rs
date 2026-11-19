@@ -71,6 +71,9 @@ pub fn start() {
 }
 
 pub fn exit() {
+    // T6：退出前把保管箱未落盘的修改收口（脏才写；锁定状态 flush 自己拒绝）。
+    // 放在写 exit 日志之前：日志写完进程就可能没了。
+    crate::secrets::flush_on_exit();
     write_line("exit", &format!("原因={}", take_why()));
 }
 

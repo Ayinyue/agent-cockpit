@@ -1,10 +1,17 @@
 """Exercise the installed adapter's account selection without touching real auth."""
 import ast
+import os
 import pathlib
 import unittest
 from unittest.mock import Mock
 
-SOURCE = pathlib.Path(__file__).resolve().parents[2] / 'agent-memory-suite' / 'agenthub.py'
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+# 默认测**随程序分发的那份** vendored agenthub：它才是发布物里真正执行的代码，
+# 且克隆本仓库就一定有。原先硬编码邻仓 ../agent-memory-suite/agenthub.py，
+# 换台机器（或只克隆本仓库）就 FileNotFoundError，整档测试跑不起来。
+# 需要对着上游工作副本验证时，用 AGENTHUB_SOURCE 显式指定。
+_override = os.environ.get('AGENTHUB_SOURCE')
+SOURCE = pathlib.Path(_override) if _override else ROOT / 'src-tauri' / 'vendor' / 'agenthub.py'
 tree = ast.parse(SOURCE.read_text(encoding='utf-8-sig'))
 funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ('workbuddy_full', 'workbuddy_intl_full')]
 

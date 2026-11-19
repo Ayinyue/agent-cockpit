@@ -95,8 +95,10 @@ fn run(extra: &[&str]) -> Result<Value, String> {
     let mut args: Vec<&str> = vec!["checkin"];
     args.extend_from_slice(extra);
     args.push("--json");
-    let out = match crate::agenthub::command(&args)
-        .and_then(|mut c| c.output().map_err(|e| e.to_string())) {
+    // 带超时：签到是 5s 轮询 + 5min 全量的后台循环，一次裸 .output() 挂住
+    // 就把整条循环钉死，后面的账号永远排不上（PERFORMANCE_PLAN P7）。
+    let (success, stdout, stderr) = match crate::agenthub::command(&args)
+        .and_then(crate::agenthub::output_with_timeout) {
         Ok(o) => o,
         Err(e) => {
             let msg = format!(
@@ -105,15 +107,15 @@ fn run(extra: &[&str]) -> Result<Value, String> {
             return Err(msg);
         }
     };
-    if !out.status.success() {
-        let s = String::from_utf8_lossy(&out.stderr);
+    if !success {
+        let s = String::from_utf8_lossy(&stderr);
         let msg = format!(
             "签到后端失败：{}",
             s.trim().chars().take(180).collect::<String>()
         );
         return Err(msg);
     }
-    let parsed: Value = match serde_json::from_slice(&out.stdout) {
+    let parsed: Value = match serde_json::from_slice(&stdout) {
         Ok(v) => v,
         Err(e) => {
             let msg = format!("签到后端输出不是 JSON：{e}");

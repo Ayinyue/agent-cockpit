@@ -66,14 +66,15 @@ pub fn auth_ready() -> bool {
 }
 
 pub fn cookie() -> Result<String, String> {
-    let output = crate::agenthub::command(&["cookie", "doubao", "--json"])
-        .and_then(|mut command| command.output().map_err(|error| error.to_string()))
+    // 带超时：豆包签到/反代都要先取 cookie，裸 .output() 挂住会拖死整条链路（P7）。
+    let (success, stdout, stderr) = crate::agenthub::command(&["cookie", "doubao", "--json"])
+        .and_then(crate::agenthub::output_with_timeout)
         .map_err(|error| format!("无法启动豆包登录态读取：{error}"))?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
+    if !success {
+        let error = String::from_utf8_lossy(&stderr);
         return Err(format!("读取豆包登录态失败：{}", error.trim()));
     }
-    let value: Value = serde_json::from_slice(&output.stdout)
+    let value: Value = serde_json::from_slice(&stdout)
         .map_err(|error| format!("豆包登录态结果格式错误：{error}"))?;
     if let Some(error) = value.get("error").and_then(Value::as_str) {
         return Err(error.to_string());

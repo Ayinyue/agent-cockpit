@@ -32,6 +32,8 @@ agsync deploy                                # 部署
 
 PowerShell 设置身份使用 `$env:AGSYNC_OWNER='你的固定名'`。新克隆目录若没有 `.agent-sync/`，先安装 agent-sync 工具并初始化该工作区；编译命令、测试命令和部署路径需要按本机配置。`agsync build` 是否包含隐私门，取决于工作区实际的 `build_cmd` / `test_cmd`，不能仅凭命令名称认定已经扫描。
 
+> **本机现状（2026-11-19 核实）**：上文 `~/.agents/skills/agent-sync/` 在本机已不存在，agsync 也不在 PATH。它是**本机私有工具、不随仓库分发**（`.agent-sync/` 在 `.gitignore` 内，git 历史从未跟踪）；当前 `.agent-sync/` 仅存浏览器 QA 截图，无 config/tasks/board/lock 等协议状态，无法据此初始化。已穷尽本机全盘、公开网络（PyPI/npm/crates 的同名 `agsync`/`agent-sync`/`agentsync` 及 Berkeley `Agency` 均为无关项目，命令面不含 board/task/build/deploy）、Skill 市场与本仓库 docs，确认公开渠道不可恢复。**协调入口恢复前不要直接 `cargo build`/`cargo test` 绕过铁律**；需先找回 `~/.agents/skills/agent-sync/`（含 `bin/agsync.py` 与 `SKILL.md`）并初始化工作区。
+
 ### 部署前两条硬检查
 
 1. **实例竞态**：有多个驾驶舱实例在跑就中止，先关掉多开的。

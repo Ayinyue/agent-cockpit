@@ -206,6 +206,7 @@ fn save_sites(items: &[Value], cfg: &Value) {
         let _ = secrets::flush();
     }
     secrets::set_plaintext_left(left);
+    crate::proxy::invalidate_legacy_pool(); // T7：Key 台账变更，路由成员清单立即重算
 }
 
 /// 解锁之后（以及启动时）把文档里残留的明文收进保管箱

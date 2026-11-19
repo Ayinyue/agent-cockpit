@@ -6,6 +6,7 @@ const path = require('node:path');
 const http = require('node:http');
 const { chromium } = require('playwright');
 
+const { launchBrowser } = require('./browser-launch.cjs');
 const root = path.resolve(__dirname, '../ui');
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
 const server = http.createServer((req, res) => {
@@ -22,7 +23,7 @@ test('long-range chart uses recorded buckets, filtered scope and updates focused
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser;
   try {
-    browser = await chromium.launch({ channel: 'chrome', headless: true });
+    browser = await launchBrowser({});
     const page = await browser.newPage({ viewport: { width: 1320, height: 850 } });
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));

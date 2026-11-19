@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const { chromium } = require('playwright');
+const { launchBrowser } = require('./browser-launch.cjs');
 const root = path.resolve(__dirname, '../ui');
 const artifacts = path.resolve(__dirname, '../.agent-sync/typography-evidence');
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
@@ -156,7 +157,7 @@ async function inspectHome(page, cdp) {
   fs.mkdirSync(artifacts, { recursive: true });
   let browser;
   try {
-    browser = await chromium.launch({ channel: 'chrome', headless: true });
+    browser = await launchBrowser({});
     const page = await browser.newPage();
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => localStorage.setItem('cockpit-toured', '1'));

@@ -3,8 +3,9 @@ const { chromium } = require('playwright');
 const { pathToFileURL } = require('node:url');
 const path = require('node:path');
 const fs = require('node:fs');
+const { launchBrowser } = require('./browser-launch.cjs');
 (async () => {
-  const browser = await chromium.launch({channel:'chrome',headless:true});
+  const browser = await launchBrowser({});
   try {
     const page = await browser.newPage({viewport:{width:1440,height:1080}});
     const errors=[]; page.on('pageerror',e=>errors.push(e.message));
@@ -26,6 +27,11 @@ const fs = require('node:fs');
     assert.equal(Math.round(await page.locator('#panel').evaluate(e=>e.offsetLeft)),400);
     await page.mouse.move(1000,300);
     assert.notEqual(await page.locator('#pet').evaluate(e=>e.style.getPropertyValue('--tilt-x')),'0deg');
+    // 「贴边提示条」默认关闭（reminder-prototype.js:9 hint=false）：收起后只留细缝 seam，
+    // 标签 tab 是 hidden 且**不会**被 placeTab 赋 data-edge（:78-81）。
+    // 下面这段验的就是标签行为，必须先把它打开——否则断言 data-edge 永远等不到。
+    const hintToggle = page.locator('#hint');
+    if (!await hintToggle.isChecked()) await hintToggle.check();
     for(const [id,tab,mode] of [['panel','edge','panelOnly'],['pet','petEdge','petOnly']]) {
       await page.locator('#'+mode).click();
       for(const side of ['left','right','top','bottom']) {
@@ -39,7 +45,12 @@ const fs = require('node:fs');
         // Hover keeps the newly docked entry open; leaving alone must retract it.
         await page.mouse.move(20,20);
         await page.waitForFunction(id=>document.getElementById(id).dataset.docked==='true',id);
-        await page.waitForTimeout(260);
+        // 别赌 260ms：原型 .floating 的 transition 是 240ms，只留 20ms 余量，
+        // 换浏览器/机器负载高一点就采到中间态（chromium 上实测 data-edge 还是 null）。
+        // 等「收起动画真的结束」这个条件——tab 的 data-edge 落到期望值。
+        await page.waitForFunction(
+          ([tabId,want])=>document.getElementById(tabId).getAttribute('data-edge')===want,
+          [tab,side]);
         assert.equal(await page.locator('#'+tab).getAttribute('data-edge'),side);
         await page.locator('#'+tab).hover();
         await page.waitForFunction(id=>document.getElementById(id).dataset.docked==='false',id);

@@ -510,6 +510,27 @@ async function run(action, extra = {}) {
    写盘后它和磁盘一致）。容差 100ms 盖住"fetch 发起晚于点击、但读盘早于落盘"的窄缝。 */
 let lastSettingsWrite = 0;
 
+/* 轮询重建守卫（PERFORMANCE_PLAN T3 / P2）。
+   4 秒一轮的 get_state 只要回来就整页重渲染，哪怕数据一个字都没变——
+   侧栏、卡片、监听器全跟着重建一遍，滚动位置和输入焦点都得靠护栏去救。
+   这里在**轮询这条路**上加签名比对：后端状态没变就不重建 DOM。
+
+   红线（改这段前先读）：
+   1. 只拦「轮询拿回来的同一份数据」，**不拦用户交互**——render() 本身保持无条件重建，
+      切页/点按钮/改设置那些调用照旧立刻生效。
+   2. 签名必须覆盖 render() 真正读到的每一份数据；漏一个字段就是「该刷新的不刷新」。
+      所以这里直接对**整份 state** 取签名，不做挑字段的小聪明。
+   3. 视图/当前 Agent 变了必须重建（同一份数据在不同页要渲染不同东西）。
+   4. 拿不到签名（异常/旧桥）一律按「变了」处理，宁可多渲染一次也不漏刷新。 */
+let lastPollSignature = '';
+function stateSignature(d, view, cur) {
+  try {
+    return `${view}|${cur}|${JSON.stringify(d)}`;
+  } catch {
+    return '';   // 循环引用等异常：当作变了
+  }
+}
+
 async function load() {
   if (S.busy) return;
   S.busy = true;
@@ -517,9 +538,16 @@ async function load() {
     const t0 = Date.now();
     const d = await invoke('get_state');
     if (S.data?.settings && t0 <= lastSettingsWrite + 100) d.settings = S.data.settings;
+    const previousCur = S.cur;
     S.data = d;
     if (!S.cur || !S.data.apps.some((a) => a.id === S.cur)) S.cur = S.data.apps[0]?.id;
-    render();
+    const signature = stateSignature(d, S.view, S.cur);
+    // 签名为空 = 算不出来，按变了处理；上一轮为空同理（首轮、以及任何一次交互后必渲染）
+    const unchanged = signature !== '' && signature === lastPollSignature && previousCur === S.cur;
+    if (!unchanged) {
+      render();          // render() 内部会把签名置空
+      lastPollSignature = signature;   // 渲染完再记下这一份，供下一轮比对
+    }
   } catch (e) {
     toast(`状态读取失败：${e}`, false);
   } finally {
@@ -543,6 +571,10 @@ const agentScrolls = new Map();
 
 function render() {
   const d = S.data;
+  // 任何一次真实重建都要让轮询签名失效：交互（切页/点按钮/改设置）之后，
+  // 即使后端数据没变，下一轮也必须重新渲染一次，否则界面会停在交互前的样子。
+  // 只有 load() 里「签名相同」那条路会跳过 render，所以这里置空是安全的。
+  lastPollSignature = '';
   applyAppearance(d.settings?.appearance);
   renderChips(d);
   renderAlerts(d);

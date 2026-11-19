@@ -390,6 +390,11 @@ pub fn retry_pending(port: u16) -> Value {
     let mut removed = 0usize;
     let mut notes = Vec::new();
     let mut trae_done = false;
+    // 同一轮 sweep 复用一份实时快照：原先每个待清理项都 snapshot_fresh() 一次，
+    // N 项就把整张进程表扫 N 遍（sysinfo 枚举 + 命令行，冷启 300ms+）。
+    // 仍然用 fresh（不是 TTL 缓存）——「客户端还在跑就不许改它配置」是正确性护栏，
+    // 不能为了省时间放宽；这里省的只是**同一轮内的重复扫描**。
+    let mut sweep_snapshot = None;
     for app in pending {
         if cached_model_client(&app) {
             if trae_done {
@@ -397,7 +402,8 @@ pub fn retry_pending(port: u16) -> Value {
             }
             trae_done = true;
         }
-        if procs::agent_running(&app, &procs::snapshot_fresh()) {
+        let snapshot = sweep_snapshot.get_or_insert_with(procs::snapshot_fresh);
+        if procs::agent_running(&app, snapshot) {
             notes.push(format!("{} 还在运行，退出后会自动清理", label(&app)));
             continue;
         }

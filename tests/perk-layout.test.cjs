@@ -7,6 +7,7 @@ const path = require('node:path');
 const http = require('node:http');
 const { chromium } = require('playwright');
 
+const { launchBrowser } = require('./browser-launch.cjs');
 const root = path.resolve(__dirname, '../ui');
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
 const server = http.createServer((req, res) => {
@@ -51,14 +52,20 @@ function boxOf(page, sel) {
 (async () => {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}/index.html`;
-  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const browser = await launchBrowser({});
   const page = await browser.newPage({ viewport: { width: 1080, height: 900 } });
+  // 同其余用例：屏蔽新手引导，避免 .tourmask 覆盖积分包列表影响取尺寸与交互。
+  await page.addInitScript(() => localStorage.setItem('cockpit-toured', '1'));
   const fails = [];
   const check = (ok, msg) => { if (!ok) fails.push(msg); };
 
   for (const width of [1080, 860, 720]) {
     await page.setViewportSize({ width, height: 900 });
     await page.goto(base, { waitUntil: 'load' });
+    // load 事件不等于 mock 数据就位：没有 __TAURI_INTERNALS__ 时 app.js 会异步
+    // import mock.js 再填 S.data，早一步 seed 就撞 `S.data` 为 null。
+    // 与 brand/settings 等用例同口径：等状态真的可用。
+    await page.waitForFunction(() => typeof S !== 'undefined' && S.data && !S.busy);
     await seed(page);
     await page.waitForSelector('#perks-list .perk');
 
