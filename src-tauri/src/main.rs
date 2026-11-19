@@ -7,6 +7,7 @@ mod agenthub;
 mod agentcrypt;
 #[cfg(windows)]
 mod dpapi_native;
+mod usage_local;
 mod ai;
 mod brand;
 mod antigravity;

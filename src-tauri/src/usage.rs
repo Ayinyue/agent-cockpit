@@ -76,7 +76,20 @@ fn collect_inner(app_id: &str, data_dir: &str, with_records: bool) -> CollectRes
     }
     let path = path.canonicalize().map_err(|_| "无法解析本地用量目录。".to_string())?;
     let key = format!("{}|{}|{}", app_id, path.to_string_lossy().to_lowercase(), with_records);
-    cached_source(key, || run_helper(app_id, &path, with_records))
+    cached_source(key, || {
+        // T17 第一阶段：codex/chatgpt 走 Rust 原生解析 + SQLite 增量缓存（免 python 冷启
+        // 与整包 json.loads/dumps）。失败回退 python 路径——迁移期两条路互为保底，
+        // golden 测试钉住数字一致（tests/usage-local-rust-golden.test.py）。
+        // 其余产品（claude/messages、各 DB）仍走 python，后续批次迁移。
+        if app_id == "codex" || app_id == "chatgpt" {
+            let cache_dir = crate::registry::base_dir().join("usage-cache-rust");
+            match crate::usage_local::collect_codex(app_id, &path, Some(&cache_dir), with_records) {
+                Ok(v) => return Ok(v),
+                Err(_) => { /* 回退 python */ }
+            }
+        }
+        run_helper(app_id, &path, with_records)
+    })
 }
 
 fn cached_source(key: String, fetch: impl FnOnce() -> CollectResult) -> CollectResult {
@@ -593,7 +606,10 @@ mod tests {
             .env("COCKPIT_USAGE_FIXTURE", test)
             .status().unwrap();
         assert!(status.success(), "{test} failed in isolated cockpit home");
-        assert!(root.path().join("usage-cache").is_dir(), "collector must use the isolated home");
+        // T17 后 codex 走 Rust 路径，缓存目录是 usage-cache-rust；python 回退路径仍写
+        // usage-cache。两者任一在场即证明采集器用了隔离 home（而不是用户真实数据根）。
+        assert!(root.path().join("usage-cache").is_dir() || root.path().join("usage-cache-rust").is_dir(),
+            "collector must use the isolated home");
         None
     }
 
