@@ -1,0 +1,123 @@
+{
+ "schema": "agent-cockpit-perf/1",
+ "measured_at": "2026-11-19T22:08:07",
+ "repeat": 3,
+ "aggregation": "median",
+ "conditions": {
+  "note": "纯计算耗时，不含进程启动；机器负载未受控，跨机比较前先看 conditions",
+  "python": "3.12.6",
+  "platform": "win32",
+  "cpu_count": 8
+ },
+ "usage_cache": {
+  "dir": "<数据根>/usage-cache",
+  "file_count": 10,
+  "total_bytes": 148293734,
+  "largest": {
+   "name": "155cbc3a32f8c72092fec2fd52d07ce9a102cd95c85fcb13170f63f7666878f4.json",
+   "bytes": 71103570,
+   "entries": 841,
+   "read_ms": 43.8,
+   "loads_ms": 1609.1,
+   "dumps_ms": 1368.8,
+   "roundtrip_ms": 3021.7,
+   "samples": {
+    "read": [
+     64.9,
+     43.0,
+     43.8
+    ],
+    "loads": [
+     2743.0,
+     1609.1,
+     1381.0
+    ],
+    "dumps": [
+     1002.8,
+     1454.4,
+     1368.8
+    ]
+   }
+  },
+  "top3": [
+   {
+    "name": "155cbc3a32f8c72092fec2fd52d07ce9a102cd95c85fcb13170f63f7666878f4.json",
+    "bytes": 71103570,
+    "entries": 841,
+    "read_ms": 43.8,
+    "loads_ms": 1609.1,
+    "dumps_ms": 1368.8,
+    "roundtrip_ms": 3021.7,
+    "samples": {
+     "read": [
+      64.9,
+      43.0,
+      43.8
+     ],
+     "loads": [
+      2743.0,
+      1609.1,
+      1381.0
+     ],
+     "dumps": [
+      1002.8,
+      1454.4,
+      1368.8
+     ]
+    }
+   },
+   {
+    "name": "22603bbabfdc7f07681bc299ab332da515d226aaa0cce4552181532a71fa36e4.json",
+    "bytes": 44486364,
+    "entries": 164,
+    "read_ms": 29.2,
+    "loads_ms": 1603.6,
+    "dumps_ms": 1070.8,
+    "roundtrip_ms": 2703.6,
+    "samples": {
+     "read": [
+      44.1,
+      29.0,
+      29.2
+     ],
+     "loads": [
+      1466.1,
+      1626.4,
+      1603.6
+     ],
+     "dumps": [
+      1070.8,
+      1264.3,
+      978.5
+     ]
+    }
+   },
+   {
+    "name": "ab184548a5b82d94b388239e6936e177ed526ca821a2099fd0d2abf613dee18f.json",
+    "bytes": 13475991,
+    "entries": 1,
+    "read_ms": 8.2,
+    "loads_ms": 267.4,
+    "dumps_ms": 221.8,
+    "roundtrip_ms": 497.4,
+    "samples": {
+     "read": [
+      13.2,
+      7.6,
+      8.2
+     ],
+     "loads": [
+      267.4,
+      351.9,
+      252.7
+     ],
+     "dumps": [
+      221.8,
+      249.3,
+      220.2
+     ]
+    }
+   }
+  ]
+ }
+}
