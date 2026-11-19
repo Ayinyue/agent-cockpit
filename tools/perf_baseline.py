@@ -113,7 +113,11 @@ def collect(repeat=REPEAT) -> dict:
             "cpu_count": os.cpu_count(),
         },
         "usage_cache": {
-            "dir": str(cache_dir),
+            # 相对数据根的描述，不落绝对路径：baseline_perf.json 要随仓库分发，
+            # 绝对路径含开发者家目录（privacy_check 的 personal-home-path 会拦），
+            # 且换机器后本来就没有可比性。测试契约不消费 dir，回归比对用
+            # perf.data_root() 现场解析（见 perf-baseline.test.py 的同口径比对）。
+            "dir": "<数据根>/usage-cache",
             "file_count": len(files),
             "total_bytes": total_bytes,
             "largest": measured[0] if measured else None,
