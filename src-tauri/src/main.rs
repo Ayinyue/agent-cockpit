@@ -65,6 +65,7 @@ mod storage;
 mod swap;
 mod traeproxy;
 mod trae_clean;
+mod zcode_auth;
 mod usage;
 mod usage_dashboard;
 mod wbproxy;

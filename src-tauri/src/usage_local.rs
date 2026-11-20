@@ -72,6 +72,9 @@ pub fn is_truthy_pub(v: &Value) -> bool { is_truthy(v) }
 /// 跨模块复用（trae_clean 等）：python str(value) 的 JSON 标量渲染。
 pub fn py_str_pub(v: &Value) -> String { py_str(v) }
 
+/// 跨模块复用（zcode_auth 等）：python number() 口径（非负有限 f64，否则 0）。
+pub fn number_pub(v: &Value) -> f64 { number(v) }
+
 fn first_truthy<'a>(vals: &[Option<&'a Value>]) -> Option<&'a Value> {
     vals.iter().flatten().copied().find(|v| is_truthy(v))
 }
