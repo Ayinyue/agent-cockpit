@@ -1,0 +1,194 @@
+# CI 编译工作流（2026-11-20 创建）
+#
+# 背景：此前仓库从未有任何 workflow，「推送触发 CI 编译」实际不会发生（两仓 Actions 运行数均为 0）。
+# 本工作流补齐该缺口，口径对齐 docs/DEVELOPMENT.md「测试」表与 tools/private_build.py：
+#   - Windows-only 项目（DPAPI / webview2-com / windows crate）→ windows-latest + MSVC 工具链。
+#   - Rust 钉 1.100.0（与本地验证同版本）；release 带 --features custom-protocol（private_build.py 同口径）。
+#   - release 产物路径脱敏（--remap-path-prefix → /source、/home/build），二进制过隐私门。
+#   - 门禁顺序：Rust 全量单测 → release 编译 → 源码/二进制隐私扫描 → 离线 Python/Node 回归
+#     → 跨语言 golden（vendored 内置 python，零 pip 安装）。
+#
+# 关键设计（都是核实过的坑，改动前先读）：
+#   1. 测试编译不带 remap 标志：golden 驱动脚本自起 `cargo test` 子进程（不带 RUSTFLAGS），
+#      若主测试套件走 private_build 的 remap 标志，指纹失配会触发 golden 侧全量重编（超时风险）。
+#      故测试用裸 cargo（RUSTFLAGS 为空，与 golden 子进程同指纹，junction 复用同一 target）；
+#      只有 release 发布产物走 private_build.py 脱敏（它不参与 golden）。
+#   2. 不缓存 target：RUSTFLAGS/路径字面量跨 runner 不同会导致指纹失配；只缓存 registry
+#      （路径无关）。target 每轮干净重建，可复现性优先。
+#   3. 隐私扫描只喂 git 跟踪清单（tools/ci_privacy_gate.py）：registry 缓存、解出的 vendored
+#      运行时、ci-target 都是未跟踪产物，privacy_check 默认扫 --others 会把第三方 crate 的
+#      示例邮箱误报成 findings。规则引擎复用 privacy_check 本体，不另立口径。
+#   4. golden 脚本硬编码两处本机路径：~/.cargo/bin/cargo.exe（rustup 默认安装位，CI 吻合）与
+#      兄弟目录 target（ROOT.parent/agent-cockpit-health-review/cargo-target）→ junction 指到
+#      ci-target 复用编译缓存。内置 python 由 tools/ci_prepare_runtime.py 从入库 vendor zip
+#      解出（与产品运行时逐字节一致，cryptography 随 agenthub-libs.zip 而来，零 pip）。
+#   5. 离线回归驱动用 setup-python 3.14（chatgpt-history 的 .zst 用例需 compression.zstd，
+#      3.14 起；runner 预装 3.12 会 ImportError）。
+#
+# 与本机 agsync 铁律的关系：agsync 协调的是「共享开发工作区」的编译/部署锁；CI 在 GitHub 托管的
+# 一次性干净 runner 上运行，不触碰本机工作区与部署路径，不属于该锁的管辖对象（DEVELOPMENT.md
+# 明确 agsync 是本机私有工具、不随仓库分发）。
+#
+# 不在此跑的（有意排除，不是遗漏）：
+#   - 浏览器套件（tests/*.test.cjs）：需要 Chromium/CDP 环境，另行安排。
+#   - T17_REAL_APPS / AGENTCOCKPIT_HISTORY_SMOKE 等真机抽样：读本机真实档案，CI 无数据且属 opt-in。
+#   - 部署：CI 只编译验证，永不部署。
+
+name: CI
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# 同一分支连续推送只保留最新一轮，避免排队烧时长
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI 专用 target（与本机隔离验证同纪律）；golden 脚本经 junction 复用同一份
+  CARGO_TARGET_DIR: ${{ github.workspace }}\ci-target
+
+jobs:
+  build-and-test:
+    name: Windows 编译 + 回归
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 项目无 rust-toolchain 文件；本地验证用 1.100.0（2026-11-09），CI 钉同一版本保证可复现。
+      # dtolnay/rust-toolchain 走 rustup，cargo 落在 ~/.cargo/bin（golden 脚本硬编码位吻合）。
+      - name: Install Rust (MSVC, pinned 1.100.0)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          targets: x86_64-pc-windows-msvc
+
+      # 只缓存 registry（路径无关）；不缓存 target，理由见文件头设计注 2
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-reg-${{ runner.os }}-1.100.0-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-reg-${{ runner.os }}-1.100.0-
+
+      # runner 预装 python 3.12；chatgpt-history 的 .zst 用例需 compression.zstd（3.14 起）。
+      # 离线回归驱动统一钉 3.14，与产品 vendored 运行时同代。
+      - name: Setup Python 3.14 (offline regression driver)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Rust full test suite (no remap flags, golden-compatible fingerprints)
+        working-directory: src-tauri
+        run: |
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 发布产物走 private_build.py：路径脱敏 + --features custom-protocol + CARGO_NET_OFFLINE。
+      # registry 已由上一步 cargo test 填充，离线可用。
+      - name: Release build (custom-protocol, path-remapped)
+        run: |
+          python tools/private_build.py build --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Privacy gate (tracked source + release binary)
+        run: |
+          python tools/ci_privacy_gate.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/privacy_check.py --binary "$env:CARGO_TARGET_DIR\release\agent-cockpit.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Node paste-parser regression
+        run: |
+          node tests/paste-test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # golden 驱动要求内置 python（~/.agent-cockpit/usage-runtime/python-3.14.10-*/python.exe，
+      # 带 cryptography）。从入库 vendor zip 解出与产品运行时逐字节一致的 vendored 运行时，
+      # 零 pip；自检 cryptography/compression.zstd/sqlite3 可导入，失败即红（fail closed）。
+      - name: Materialize vendored Python runtime (from tracked zips)
+        run: |
+          python tools/ci_prepare_runtime.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # golden 脚本硬编码兄弟目录 target（ROOT.parent/agent-cockpit-health-review/cargo-target）
+      # → junction 到 ci-target（同盘符免管理员），复用本轮测试编译缓存，避免二次全量编译超时。
+      - name: Link golden target dir to CI target
+        run: |
+          $link = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) "agent-cockpit-health-review\cargo-target"
+          New-Item -ItemType Directory -Force -Path (Split-Path $link -Parent) | Out-Null
+          if (-not (Test-Path $link)) {
+            New-Item -ItemType Junction -Path $link -Target $env:CARGO_TARGET_DIR | Out-Null
+          }
+          Write-Host "golden target -> $env:CARGO_TARGET_DIR"
+
+      - name: Offline Python regression suite
+        run: |
+          $tests = @(
+            'tests/privacy-check.test.py',
+            'tests/agenthub-bundle.test.py',
+            'tests/perf-baseline.test.py',
+            'tests/usage-local.test.py',
+            'tests/agentfind-source-counts.test.py',
+            'tests/workbuddy-quota.test.py',
+            'tests/zcode-proxy-auth.test.py',
+            'tests/chatgpt-history.test.py',
+            'tests/chatgpt-history-shared.test.py',
+            'tests/chatgpt-history-sync.test.py',
+            'tests/license-report.test.py'
+          )
+          $failed = @()
+          foreach ($t in $tests) {
+            Write-Host "::group::$t"
+            python $t
+            if ($LASTEXITCODE -ne 0) { $failed += $t }
+            Write-Host "::endgroup::"
+          }
+          if ($failed.Count) { Write-Host "FAILED: $($failed -join ', ')"; exit 1 }
+
+      # golden 驱动进程用 vendored python（带 cryptography）；Rust 侧 cargo 子进程由脚本自起，
+      # 经 junction 命中同一 target（指纹一致，见设计注 1）。
+      # license-report 本机沙箱的 tempfile 清理拦截（CHAT_REFERENCE_PROTECTED）在 CI 不存在，应全绿。
+      - name: Cross-language golden (crypto / DPAPI / usage / zcode / trae / history-repair)
+        run: |
+          $py = Join-Path $env:USERPROFILE ".agent-cockpit\usage-runtime\python-3.14.10-ci\python.exe"
+          $goldens = @(
+            'tests/agentcrypt-golden.test.py',
+            'tests/dpapi-native-golden.test.py',
+            'tests/usage-local-rust-golden.test.py',
+            'tests/zcode-auth-rust-golden.test.py',
+            'tests/trae-clean-rust-golden.test.py',
+            'tests/chatgpt-history-repair-rust-golden.test.py'
+          )
+          $failed = @()
+          foreach ($t in $goldens) {
+            Write-Host "::group::$t"
+            & $py -B -X utf8 $t
+            if ($LASTEXITCODE -ne 0) { $failed += $t }
+            Write-Host "::endgroup::"
+          }
+          if ($failed.Count) { Write-Host "FAILED: $($failed -join ', ')"; exit 1 }
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-cockpit-windows-x64
+          path: ci-target/release/agent-cockpit.exe
+          if-no-files-found: error
+          retention-days: 14
