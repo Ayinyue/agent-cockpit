@@ -282,11 +282,15 @@
   须真实登录态 golden 样本 + 单独授权，不在本轮擅自迁移。
   **CI 编译工作流**已于 11-20/21 建成并全绿（run #3，见上表）；浏览器套件与真机抽样有意不在 CI 内。）
 
-- **上游分叉待整合（2026-11-21 核实）**：origin/main 领先 8 提交（v2.6.0 积分台账/密钥体检/站点级取模型 + agentfind 脚本合一），
-  与本会话 T17/T18/T19 改动**直接冲突**：上游 `zcode-auth.py` 新增 enc:v2 凭据信封（OS keyring/env 双源 + 24-hex 指纹校验，+198 行）
-  且 `zcode.rs` 回退了 T18 Rust 接线；上游 `agentfind.py` 把 PAGE 重新内嵌（+790 行，与 T19② 静态资源化相反）并修了启动自证自杀。
-  合并须以**上游功能为准、迁移层重新适配**（enc:v2 需先迁 Rust 或保留 python 回退；PAGE 静态资源化需在上游新版前端上重做），
-  属新批次工作，不在 CI 批次擅自合并。本会话 main 已推 fork（9ac0d54），未动 origin。
+- **上游分叉已整合（2026-11-21，用户决策「整合上游·含 enc:v2 迁 Rust」）**：merge origin/main（v2.6.0 积分台账/密钥体检/站点级取模型 + agentfind 脚本合一），
+  合并提交 **4f0737a**（58 文件 +9913/−683），**fork CI run #5 全绿**。冲突按「上游功能为准、迁移层重新适配」解：
+  main.rs 保留 T12/T5 并发+批量并整合上游 auto_quota_bound；agentfind.py 取上游全量（_identity_at 自证修复+滚动修复+board 视图）并在新版 PAGE 上重做 T19② 静态资源化；
+  agenthub.py 取上游 doubao 真余额（quota wallet/overview）+_win_shared_copy/_dpapi_protect，加回 work/doubaowork_credit。
+  **enc:v2 已迁 Rust**（zcode_auth.rs：os_key CredReadW/CredEnumerateW + env_key 三源 + 24-hex 指纹校验 + AES-GCM，未知信封报错修退化 bug，v1 fallback 平台口径 win32 修正）；
+  跨语言 golden 6 模式全绿（含 v2 env-source），os-source 合成密钥环 round-trip 验证，12 单测+2 变异红。zcode.rs Rust 优先回退 python。
+  测试适配：workbuddy-quota 补 _wb_expired_* mock（上游测试自身缺陷）、agenthub-bundle DOUBAO_CACHE 断言改精准检查 DPAPI 加密（上游新增安全特性）。
+  全量 508 过/0 失败/34 忽略 + 第二二进制 3/3 + 离线 11 套 + golden 6 套全绿，privacy 0。结果留档 upstream-merge-enc-v2-result.json。
+  **未 push origin、未部署**；enc:v2 os-source 真实凭据验证待有真实 v2 登录态样本（本机全 v1）。
 
 ---
 
