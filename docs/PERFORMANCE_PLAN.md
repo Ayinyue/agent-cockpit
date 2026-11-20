@@ -246,6 +246,8 @@
 | **T17 第一阶段**（2026-11-19，用户「授权开工」） | codex/chatgpt 解析迁 Rust：新增 `usage_local.rs`（codex 累计终值差分/重复帧跳过/last 兜底 + aggregate 去重 + **SQLite 按文件指纹增量缓存**，rusqlite bundled）；`usage.rs collect_inner` 接线 codex→Rust、失败回退 python；其余产品仍 python 后续批次。**不做 1:1 翻译**（计划红线）：整包 json 缓存→SQLite 只重算变化文件 | **跨语言 golden 双重验证**：合成 fixture（差分/重复帧/last兜底/跨时区/坏行）+ 真实 ~/.codex（3 文件/total=6442910）python↔Rust 逐字段与事件 id 集合一致；4 条单测绿（含缓存复用/prune/指纹重算）；**变异红**（累计回退分支改坏即红）。全量 **459 项 = 426 过 / 0 失败 / 33 忽略**。真实 1.3MB：Rust warm 42.6ms vs python 74.9ms（另免 ~1s python 冷启）；67.8MB 大缓存场景待真实数据补测。privacy 0 findings。identity 口径两处漂移已修（timestamp %s 原样 / f64 比对）。未部署 |
 | **T17 第二阶段**（2026-11-20，用户「继续推进」） | messages 系 12 产品解析迁 Rust（claude/qoder/qwenwork/workbuddy/codebuddy/minimax 各系）：`message_file`（session:messageId 分组/fragment 去重/user 输入估算累计/usage 取组内最大帧/claude·minimax·standard 三 style）+ `collect_messages` 共享 SQLite 增量缓存（parser_version=rust-messages/1）；`usage.rs` 接线 messages→Rust 失败回退 python。**本会话另修 4 处口径漂移**：aggregate 浮点累加改首现序（HashMap 随机序末位漂移）/ py_lines universal newlines（lone \r 切行）/ index 兜底只数解析成功行 / BOM 只剥文件头一次 | **跨语言 golden**：合成 4/4（codex/claude/workbuddy/minimax）+ **真实 4 目录全量逐事件一致**（claude 17 文件/qoder-cn **841 文件 2.66GB**/qwenworkcn 349/workbuddy 58，with_records=True）。5 条新护栏单测 + **4 条变异全红**还原零残留。全量 **467 项 = 434 过 / 0 失败 / 33 忽略**（459→467 +8）。性能真实：claude 172MB warm **1.24s vs python 11.6s（9.4×）**、workbuddy 362MB warm 2.26s（5.2×）、qwenworkcn 126MB warm 0.56s（16.2×），totals 全一致；首采≈python（解析主导），收益在 warm 增量+免 python 冷启。qwenworkcn 首轮一次不可复现失败已 4/4 复跑排除+顺序隐患修复。privacy 0 findings。临时探针已删（grep=0）。**已提交 73f7a53** |
 | **T17 第三阶段**（2026-11-20，用户「推进 T17 第三阶段」） | DB 系/dsh/gemini 解析迁 Rust：`zcode_db`（model_usage 请求库，provider/computed total 兜底+failure+计时）/`opencode_db`（新表 session_message 覆盖旧表同 id，opencode style reasoning 单列）/`marvis_db`（llm_token_usage 逐行）/`astudio_db`（拆 report_json.model_usages 子 turn）/`dsh_file`（zstd 解压+assistant/message 过滤）/`gemini_file`（整包 JSON messages+user 累计估算）；`collect_other` 统一入口+`is_other_app`；`usage.rs` 接线→Rust 失败回退 python。EventOpts 加 duration/ttft，event() 补计时字段。Cargo.toml 加 zstd 0.13 | **真实 zcode 1.23GB/27197 行/total=7507353979 + marvis 76 行 python↔Rust 逐事件一致**；4 条合成单测（zcode total 兜底/opencode 新表覆盖/dsh zstd/gemini 估算）；**4 条变异红**还原零残留。全量 **472 项 = 439 过 / 0 失败 / 33 忽略**（467→472 +5）。dsh 真实 173 文件全为 session 类型无 usage（python 亦 None），合成 fixture 验证口径。privacy 0 findings。**已提交 399d7af**。至此 usage-local.py 全部产品（codex/messages/DB/dsh/gemini）Rust 解析完成，python 仅作回退保底 |
+| **T18 第一批**（2026-11-20，用户「继续推进」） | `trae-gateway-clean.py` 迁 Rust：新增 `trae_clean.rs`（clean_db：ItemTable model_list_map 网关条目识别+删除+选择记录剪枝，is_gateway/has_token 整标识符边界/prune_selection）；`gateway_cleanup.rs run_script` 接线 Rust 优先失败回退 python | **跨语言 golden**：合成 state.vscdb python run vs Rust clean_db 输出+写回后库内容逐字段一致（removed=3 keys=3）。6 条单测绿；**2 条变异红**（has_token 去 ./ 边界/is_gateway 恒假）还原零残留。全量 **478 项 = 445 过 / 0 失败 / 33 忽略**（472→478 +6）。privacy 0 findings。**已提交 c49df32** |
+| **T18 第二批**（2026-11-20，用户「继续推进」） | `zcode-auth.py` 迁 Rust：新增 `zcode_auth.rs`（identity/snapshot/proxy_credential/merge/run，enc:v1: AES-GCM 解密用 T14 agentcrypt）；`zcode.rs helper` 接线 Rust 优先失败回退 python | **跨语言加密 golden**：python cryptography 加密合成 record → Rust 解密，identity/snapshot/merge/merge_logout 四模式输出逐字段一致。9 条单测绿（含加密 round-trip）；**2 条变异红**（merge 去前缀过滤/identity 去 access 判空）还原零残留。全量 **487 项 = 454 过 / 0 失败 / 33 忽略**（478→487 +9）。privacy 0 findings。**已提交 dcf0e55** |
 
 **顺带修掉的 4 套既有测试缺陷**（都不是本轮引入，在 Chrome 上同样会红）：
 - `add-app-picker` / `external-checkin` / `checkin-pending-day` / `workbuddy-accounts`：未屏蔽新手引导，
@@ -266,11 +268,13 @@
 
 ### 未执行（明确留待后续，不在本轮声称完成）
 
-- **阶段四 T16/T18/T20**（agentcrypt 接生产 / 其余脚本 Rust 化 / agenthub 瘦身）：**数据丢失级风险**，须真实登录态样本 + 单独授权。
+- **阶段四 T16/T20**（agentcrypt 接生产 / agenthub 瘦身）：**数据丢失级风险**，须真实登录态样本 + 单独授权。
   T14 加密原语 + T15 原生 DPAPI 地基已建（见上表），但**未接任何生产加解密路径**；PowerShell 与 Python 冷启开销本轮**不会消失**。
-  T16 需改 vendored agenthub.py（触「不整体重写 agenthub」红线）；T18 是多日迁移。
+  T16 需改 vendored agenthub.py（触「不整体重写 agenthub」红线）。
   （T1/T6/T9/T11/T7/T12/T14地基/T15地基/T5集成/T19评估 已于 2026-11-19 完成；**T17 第一/二/三阶段**已于 11-19/11-20 完成并提交，
-  usage-local.py 全部产品 Rust 解析完成，python 仅作回退保底。T18 其余脚本待后续。）
+  usage-local.py 全部产品 Rust 解析完成，python 仅作回退保底。**T18 第一批 trae-gateway-clean / 第二批 zcode-auth** 已于 11-20 完成并提交。
+  **T18 第三批 chatgpt-history*.py（1652 行）暂缓**：涉及目录 junction/文件合并/SQLite WAL 退役/凭据隔离，属数据丢失级，
+  须真实登录态 golden 样本 + 单独授权，不在本轮擅自迁移。）
 
 ---
 
