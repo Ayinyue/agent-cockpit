@@ -26,6 +26,10 @@ def build_pair(base):
     target = base / "target"
     source.mkdir(parents=True)
     target.mkdir(parents=True)
+    # CI runner 的 TEMP 含 8.3 短名段（RUNNER~1）：plan/apply 里 resolve()/canonicalize
+    # 会展开成长名，marker 若写原始拼写则 key 不等 → ownership 误判。
+    # 与生产口径对齐（copy_history 写 marker 前先 resolve），fixture 同样先展开。
+    source, target = source.resolve(), target.resolve()
     source_state = {
         "electron-completed-local-data-migration-ids": [MIGRATION],
         "local-projects": {"proj-a": {"rootPaths": ["C:/Work/A"], "name": "A"}},
