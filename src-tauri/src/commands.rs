@@ -130,6 +130,26 @@ fn find_pair(site_id: &str, key_id: &str) -> Option<(Value, Value)> {
     Some((site, key))
 }
 
+/// 把一次拉到的模型并进站点的「可用模型」：已存在的不重复加，返回（新增数，合并后清单）。
+fn merge_site_models(sobj: &Value, ids: &[String]) -> (usize, Vec<String>) {
+    let mut merged: Vec<String> = sobj["models_list"]
+        .as_str()
+        .unwrap_or("")
+        .split([',', '，', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let mut added = 0;
+    for id in ids {
+        if !merged.iter().any(|x| x == id) {
+            merged.push(id.clone());
+            added += 1;
+        }
+    }
+    (added, merged)
+}
+
 #[tauri::command]
 pub fn get_meta(app: String, name: String) -> Value {
     let m = match reg::find_instance(&app, &name) {
@@ -1507,7 +1527,7 @@ fn run_action(act: &str, app_id: &str, name: &str, payload: &Value, st: &AppStat
                         "found_account": d["account"].as_str().unwrap_or(&uid),
                         "msg": format!(
                             "「{}」自己的官网窗口里登的是「{}」，不是这张卡绑的号。\n\
-                             在那个窗口里退出登录、再登「{}」的阿里云号，回来点一次刷新就补齐。\n\
+                             在那个窗口里退出登录、再登「{}」的官网账号，回来点一次刷新就补齐。\n\
                              这次没写进卡片：把别人的余额记到这张卡上就是串号。",
                             card_acct,
                             d["account"].as_str().unwrap_or("?"),
@@ -1892,6 +1912,16 @@ fn record_probe(out: &Value, owner: &str, model: &str) {
 fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
     if let Some(result) = crate::chatgpt::action(act, payload) { return Some(result); }
     let v = match act {
+        // 签到页里把某个账号卡藏起来 / 放回来（她 2026-11-12：某个号暂时不用了、也签不了到，
+        // 先让它灰掉别再出现）。只改驾驶舱自己的账号卡记录——档案目录、登录包、换号备份
+        // 一概不动，所以随时能原地恢复，不会丢任何一个号的登录态。
+        // 放在 app_free 里（不挂"当前选中的产品"）：签到页是按行操作的，那一步没有选中态。
+        "hide_account" | "unhide_account" => crate::checkin::set_account_hidden(
+            payload["app"].as_str().unwrap_or(""),
+            payload["store"].as_str().unwrap_or(""),
+            payload["name"].as_str().unwrap_or(""),
+            act == "hide_account",
+        ),
         // ===== Web 远程控制（手机扫码）=====
         // 这些动作只给桌面端用；手机端能碰的只有 remote.rs 里 WEB_ACTIONS 那张表
         "remote_view" => {
@@ -2854,6 +2884,12 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             json!({ "ok": true, "locked": locked, "groups": groups })
         }
 
+        // 密钥搜索：拿一段 key 去全台账里定位（原文全等 / 打码串全等 / 片段包含三档）
+        "key_search" => {
+            let q = payload["query"].as_str().unwrap_or("");
+            keys::search_keys(q)
+        }
+
         // 批量改属性：ids = [{site, id}]，patch 里出现哪些字段就改哪些。
         // 站点内勾一批 → 改用途 / 改过期日 / 改模型清单 / 开关进反代，一次落盘。
         "key_batch_update" => {
@@ -2999,18 +3035,24 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             // 根本不验 key（小红书 Dots 实测假 key 也返回 200），真调用才见分晓。
             let site = payload["site"].as_str().unwrap_or("");
             let id = payload["id"].as_str().unwrap_or("");
-            // ① 锁内快照：base / key / 模型名一次拿齐就撤，20 秒的等待不压全局锁
-            let (base, key, model) = {
+            // ① 锁内快照：base / fmt / key / 模型名一次拿齐就撤，20 秒的等待不压全局锁
+            let (base, fmt, key, model) = {
                 let _g = cmd_guard();
                 match find_pair(site, id) {
-                    Some((sobj, item)) => (
-                        keys::base_for(&sobj, &item),
-                        item["key"].as_str().unwrap_or("").to_string(),
-                        keys::models_for(&sobj, &item)
-                            .into_iter()
-                            .next()
-                            .unwrap_or_default(),
-                    ),
+                    Some((sobj, item)) => {
+                        // 地址和格式必须同源取：登记成 openai-resp 的站要打 /responses，
+                        // 不能一律当 chat/completions（星驰API 已停用 chat，2026-11-20）
+                        let (base, fmt) = keys::base_and_fmt(&sobj, &item);
+                        (
+                            base,
+                            fmt,
+                            item["key"].as_str().unwrap_or("").to_string(),
+                            keys::models_for(&sobj, &item)
+                                .into_iter()
+                                .next()
+                                .unwrap_or_default(),
+                        )
+                    }
                     None => return Some(err("记录不存在")),
                 }
             };
@@ -3024,8 +3066,78 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             } else {
                 model
             };
-            let (good, msg) = keys::chat_probe(&base, &key, &model);
+            let (good, msg) = keys::chat_probe(&base, &key, &model, &fmt);
             if good { ok(msg) } else { err(msg) }
+        }
+
+        "key_matrix" => {
+            // 接入点体检：把（密钥 × 协议）每个组合真发一条最小对话，结果给弹窗里的矩阵用。
+            // 单个组合的解释力有限——「哪把 key 能用」和「哪种协议能用」是两个维度，
+            // 只看一个维度就会把「站点停用了这个协议」误判成「这把 key 坏了」。
+            let site = payload["site"].as_str().unwrap_or("");
+            let sobj = match keys::sites().into_iter().find(|p| p["id"].as_str() == Some(site)) {
+                Some(p) => p,
+                None => return Some(err("站点不存在")),
+            };
+            let cols = keys::matrix_columns(&sobj);
+            if cols.is_empty() {
+                return Some(err("这个站点还没有接入点——点「修改站点」把协议与地址填上"));
+            }
+            let pick = |k: &str| -> Option<Vec<String>> {
+                payload[k].as_array().map(|a| {
+                    a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+                })
+            };
+            let only_key = pick("keys");
+            let only_fmt = pick("fmts");
+            let mut jobs: Vec<(String, String, String, String, String)> = Vec::new();
+            for k in sobj["keys"].as_array().cloned().unwrap_or_default() {
+                let kid = k["id"].as_str().unwrap_or("").to_string();
+                if kid.is_empty() {
+                    continue;
+                }
+                if let Some(list) = &only_key {
+                    if !list.iter().any(|x| x == &kid) {
+                        continue;
+                    }
+                }
+                let plain = k["key"].as_str().unwrap_or("").to_string();
+                let own = k["base_url"].as_str().unwrap_or("").trim().to_string();
+                // 模型名用这把 key 自己的第一项；没有就退回站点清单的第一项。
+                // 空着不填，上游多半回 400——那叫「没告诉它调哪个模型」，不叫「key 不能用」。
+                let model = keys::models_for(&sobj, &k)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| "gpt-4o-mini".to_string());
+                for (fmt, url) in &cols {
+                    if let Some(list) = &only_fmt {
+                        if !list.iter().any(|x| x == fmt) {
+                            continue;
+                        }
+                    }
+                    // 密钥自带接入点、且格式与这一列相符时优先用它
+                    let use_url = if !own.is_empty() && keys::fmt_of_url(&own) == fmt.as_str() {
+                        own.clone()
+                    } else {
+                        url.clone()
+                    };
+                    jobs.push((kid.clone(), fmt.clone(), use_url, plain.clone(), model.clone()));
+                }
+            }
+            if jobs.is_empty() {
+                return Some(err("没有可检测的组合"));
+            }
+            let cells = keys::probe_matrix(jobs, 15, 6);
+            let list: Vec<Value> = cells
+                .iter()
+                .map(|c| {
+                    json!({
+                        "key": c.key_id, "fmt": c.fmt, "state": c.state,
+                        "code": c.code, "ms": c.ms, "msg": c.msg,
+                    })
+                })
+                .collect();
+            ok(json!({ "cells": list }).to_string())
         }
 
         "key_models" => {
@@ -3115,6 +3227,31 @@ fn app_free(act: &str, payload: &Value, st: &AppState) -> Option<Value> {
             json!({
                 "ok": true,
                 "msg": format!("拉到 {} 个模型，站点清单里新增 {} 个", ids.len(), added),
+                "models": ids,
+                "models_list": merged.join(", "),
+            })
+        }
+
+        "site_models_all" => {
+            // 界面上「获取模型」全站只有一个按钮，所以它得把每个接入点都问一遍，
+            // 而不是像 site_models 那样由调用方指定某一个口。
+            let site_id = payload["site"].as_str().unwrap_or("");
+            let sobj = match keys::sites().into_iter().find(|p| p["id"].as_str() == Some(site_id)) {
+                Some(p) => p,
+                None => return Some(err("站点不存在")),
+            };
+            let (ids, notes) = keys::probe_models_all(&sobj);
+            let detail = notes.join("；");
+            if ids.is_empty() {
+                return Some(err(format!("没拉到模型：{detail}")));
+            }
+            let (added, merged) = merge_site_models(&sobj, &ids);
+            let mut upd = sobj.clone();
+            upd["models_list"] = json!(merged.join(", "));
+            let _ = keys::upsert_site(&upd);
+            json!({
+                "ok": true,
+                "msg": format!("拉到 {} 个模型，新增 {} 个（{detail}）", ids.len(), added),
                 "models": ids,
                 "models_list": merged.join(", "),
             })
@@ -3724,6 +3861,8 @@ mod tests {
             "shell_shortcut_create", "shell_shortcut_remove",
             // 签到这组里只验不打网络的两条：view/refresh 会真去调 agenthub
             "checkin_claim", "checkin_auto",
+            // 隐藏/恢复账号只写账号卡记录，空入参也该由这里接住并回一句原因
+            "hide_account", "unhide_account",
         ] {
             let p = json!({ "action": act });
             assert!(app_free(act, &p, &st).is_some(), "{} 应该被 app_free 接住", act);

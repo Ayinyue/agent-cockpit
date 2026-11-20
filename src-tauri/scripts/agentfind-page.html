@@ -275,7 +275,7 @@ button:not(.ghost):not(.go):not(.session-name):not(.more-rows){border-color:var(
 const $=id=>document.getElementById(id);
 const searchBody=$('search-body'),searchToggle=$('search-toggle'),pinToggle=$('pin-toggle');
 const searchFolds=[...searchBody.querySelectorAll('.fold')];
-let searchScrollDistance=0,searchScrollSettling=false,searchCollapsed=false;
+let searchScrollDistance=0,searchScrollSettling=false,searchCollapsed=false,searchAutoCollapsed=false;
 let searchPinned=localStorage.getItem('agentfind.searchPinned')==='1';
 const searchScrollPositions=new WeakMap();
 function setSearchCollapsed(collapsed){
@@ -288,13 +288,14 @@ function setSearchCollapsed(collapsed){
  searchToggle.setAttribute('aria-expanded',String(!collapsed));
  searchToggle.textContent=collapsed?'展开搜索 ▾':'收起搜索 ▴';
  searchScrollDistance=0;
+ if(!collapsed)searchAutoCollapsed=false;
  // Folding changes document height. Ignore the resulting scroll anchoring events.
  requestAnimationFrame(()=>requestAnimationFrame(()=>{
   searchScrollPositions.set(document,window.scrollY);
   searchScrollSettling=false;
  }));
 }
-searchToggle.onclick=()=>setSearchCollapsed(!searchCollapsed);
+searchToggle.onclick=()=>{searchAutoCollapsed=false;setSearchCollapsed(!searchCollapsed);};
 function renderPin(){
  pinToggle.classList.toggle('on',searchPinned);
  pinToggle.setAttribute('aria-pressed',String(searchPinned));
@@ -320,10 +321,15 @@ document.addEventListener('scroll',event=>{
  const position=target===document?window.scrollY:target.scrollTop;
  const previous=searchScrollPositions.get(target)||0;
  searchScrollPositions.set(target,position);
- if(searchPinned || searchScrollSettling || searchCollapsed)return;
+ if(searchPinned || searchScrollSettling)return;
+ if(searchCollapsed){
+  // 滚回页面初始位置时，把滚动自动收起的筛选区还回来；手动收起的不强行展开。
+  if(searchAutoCollapsed && target===document && position<=0)setSearchCollapsed(false);
+  return;
+ }
  const delta=position-previous;
  searchScrollDistance=delta>0?searchScrollDistance+delta:0;
- if(searchScrollDistance>=80)setSearchCollapsed(true);
+ if(searchScrollDistance>=80){setSearchCollapsed(true);searchAutoCollapsed=true;}
 },{capture:true,passive:true});
 const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
  .replace(/"/g,'&quot;');

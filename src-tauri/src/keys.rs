@@ -11,6 +11,15 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 
+/// 「请求」按钮真发对话时用的 User-Agent。
+///
+/// ureq 自己会报 `ureq/x.y`，有些中转站按 **UA 首 token** 做客户端白名单
+/// （星驰 api.xingchiapi.com：只放行 WorkBuddy / Codex / Claude Code 这类编程客户端，
+/// 裸脚本与 SDK 直连一律 403 `client_not_allowed`；2026-11-20 实测）。
+/// 测试按钮要回答的是「这把 key 在**真正用它**的客户端下能不能通」，
+/// 所以 UA 必须和那个客户端一致，否则测出来的 403 是假阴性。
+const PROBE_UA: &str = "WorkBuddy/2.5.0";
+
 /// 保管箱里这条 key 的编号。按 key id 存，站点合并/改名都不会牵动凭据。
 pub fn secret_id(key_id: &str) -> String {
     format!("apikey:{}", key_id)
@@ -458,23 +467,106 @@ fn purge_secrets(ids: &[String]) {
 /// 挂在**站点**上；key 一般不单独指定，只有确实走别的入口时才在 key 上覆盖一个。
 /// 测活、拉模型、注入都从这里取。
 pub fn base_for(site: &Value, key: &Value) -> String {
+    base_and_fmt(site, key).0
+}
+
+/// 同 `base_for`，但连这条接入点登记的兼容格式一起给出来。
+///
+/// 为什么必须成对返回：`base_for` 挑地址时有优先级（先 `openai`，再第一条），
+/// 但「这条地址按哪种协议调用」是另一件事。原先 `chat_probe` 只拿到地址、
+/// 一律按 chat/completions 打，站点登记成 `openai-resp` 也当没看见——
+/// 星驰API 停用 chat 之后点「请求」必 400（2026-11-20 她的截图）。
+/// 所以格式要和地址同源取，不能各挑各的，否则可能拿 A 口的地址配 B 口的协议。
+///
+/// 返回 (base_url, format)。format 是 `openai` / `openai-resp` / `anthropic` /
+/// `gemini` / `other`，老数据没有 format 字段时给空串（调用方按老行为处理）。
+pub fn base_and_fmt(site: &Value, key: &Value) -> (String, String) {
     let own = key["base_url"].as_str().unwrap_or("").trim();
     if !own.is_empty() {
-        return own.to_string();
+        // key 上覆盖了地址，格式依次看：key 自己的 base_format → 地址后缀 → 站点第一条。
+        // 地址后缀这一步很要紧：老数据没有 base_format 字段，但地址写成 /v1/responses
+        // 本身就说明了要走 Responses（星驰那条就是这么登记的）。
+        let kf = key["base_format"].as_str().unwrap_or("").trim();
+        let f = if !kf.is_empty() {
+            kf.to_string()
+        } else if own.trim_end_matches('/').to_ascii_lowercase().ends_with("/responses") {
+            "openai-resp".to_string()
+        } else {
+            site["base_urls"]
+                .as_array()
+                .and_then(|a| a.first())
+                .map(|b| b["format"].as_str().unwrap_or("").trim().to_string())
+                .unwrap_or_default()
+        };
+        return (own.to_string(), f);
     }
     if let Some(arr) = site["base_urls"].as_array() {
-        // 优先 OpenAI 兼容口（/models 探活和注入都最认它）
-        for want in ["openai", ""] {
+        // 优先 OpenAI 兼容口（/models 探活和注入都最认它）。
+        // 分三档而不是一档里按数组顺序找：先 `openai`（保住老站点的既有行为，
+        // 同时登记 chat 和 resp 的站不该因为 resp 排在前面就换协议），
+        // 再 `openai-resp`（只登记 Responses 口的站，星驰就是），最后随便第一条。
+        for want in ["openai", "openai-resp", ""] {
             for b in arr {
                 let f = b["format"].as_str().unwrap_or("");
                 let u = b["url"].as_str().unwrap_or("").trim();
                 if !u.is_empty() && (want.is_empty() || f == want) {
-                    return u.to_string();
+                    return (u.to_string(), f.to_string());
                 }
             }
         }
     }
-    String::new()
+    (String::new(), String::new())
+}
+
+/// 从地址反推它属于哪种兼容格式。密钥自带接入点时，要靠它判断这条地址
+/// 对应矩阵里的哪一列——否则会拿 Responses 的地址去打 chat 的口。
+pub fn fmt_of_url(url: &str) -> &'static str {
+    let low = url.trim().trim_end_matches('/').to_ascii_lowercase();
+    if low.ends_with("/responses") {
+        "openai-resp"
+    } else if low.ends_with("/messages") {
+        "anthropic"
+    } else if low.contains("generativelanguage") || low.contains(":generatecontent") {
+        "gemini"
+    } else {
+        "openai"
+    }
+}
+
+/// 矩阵的列：站点登记的接入点；一个都没登记时（老数据只把地址挂在 key 上），
+/// 按密钥自带地址反推出的格式补出来，别让弹窗直接空着。
+pub fn matrix_columns(site: &Value) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Some(arr) = site["base_urls"].as_array() {
+        for b in arr {
+            let u = b["url"].as_str().unwrap_or("").trim();
+            if u.is_empty() {
+                continue;
+            }
+            let f = match b["format"].as_str().unwrap_or("").trim() {
+                "" => fmt_of_url(u),
+                other => other,
+            };
+            if !out.iter().any(|(x, _)| x == f) {
+                out.push((f.to_string(), u.to_string()));
+            }
+        }
+    }
+    if out.is_empty() {
+        if let Some(ks) = site["keys"].as_array() {
+            for k in ks {
+                let u = k["base_url"].as_str().unwrap_or("").trim();
+                if u.is_empty() {
+                    continue;
+                }
+                let f = fmt_of_url(u);
+                if !out.iter().any(|(x, _)| x == f) {
+                    out.push((f.to_string(), u.to_string()));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 站点的模型清单：站点上那份为主，key 自己那份是补充
@@ -584,6 +676,150 @@ pub fn remove_key(site_id: &str, key_id: &str) -> (bool, String) {
     save(&items);
     purge_secrets(&[secret_id(key_id)]);
     (true, "已删除该 key".into())
+}
+
+/// 匹配档位：完全一致 / 打码一致 / 片段匹配
+#[derive(PartialEq, Debug, Clone, Copy)]
+pub enum KeyTier {
+    Exact,
+    Masked,
+    Partial,
+}
+
+/// 纯函数：判断一把 key 命中哪一档。不碰全局状态，测试能独立跑。
+///
+/// `query` 是用户原样输入的串（用于全等比较，大小写敏感）；
+/// `needle` 是归一后的片段串（小写、无空白，用于包含比较）。
+///
+/// 规则（从严到宽，先命中先算）：
+///   ① 原文全等 —— 最确定，命中即「就是这个」；
+///   ② 打码串全等 —— 用户只看到过 `sk-abc••••wxyz` 这种；
+///   ③ 片段包含 —— 只记得头尾时的兜底候选。
+///
+/// 片段一律忽略大小写并去掉空白：key 常被人从 PDF、聊天记录里复制，
+/// 中间会带换行和空格。全等比较不做任何归一，否则就不是「同一把」了。
+pub fn tier_of(plain: &str, masked: &str, query: &str, needle: &str) -> Option<KeyTier> {
+    let plain = plain.trim();
+    let masked = masked.trim();
+    let query = query.trim();
+    if !plain.is_empty() && plain == query {
+        return Some(KeyTier::Exact);
+    }
+    if !masked.is_empty() && masked == query {
+        return Some(KeyTier::Masked);
+    }
+    if needle.is_empty() {
+        return None;
+    }
+    if !plain.is_empty() {
+        let norm: String = plain
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_lowercase();
+        if norm.contains(needle) {
+            return Some(KeyTier::Partial);
+        }
+    } else {
+        // 锁箱：拿打码串的两头凑，够长（≥8 字符）才认为片段有代表性，
+        // 两头都要对上——只靠一头命中太容易误报。
+        let parts: Vec<&str> = masked.split("••••").collect();
+        if needle.len() >= 8
+            && parts.len() >= 2
+            && needle.contains(&parts[0].to_lowercase())
+            && needle.contains(&parts[1].to_lowercase())
+        {
+            return Some(KeyTier::Partial);
+        }
+    }
+    None
+}
+
+/// 密钥搜索：拿一段 key（完整原文，或只记得头尾/中间片段）去全台账里定位。
+///
+/// 用户常见场景是「手上有一把 key，不知道它属于哪家、也没记下来保存过没有」。
+/// 分三档匹配，从严到宽，详见 `tier_of`。
+///
+/// 保管箱锁着时拿不到原文（`key` 为空），此时只能退到 ②③ 两档，
+/// 界面上要如实说「锁箱，只能按打码串与片段比对」。
+pub fn search_keys(query: &str) -> Value {
+    let q = query.trim();
+    if q.is_empty() {
+        return json!({
+            "ok": true,
+            "locked": !secrets::available(),
+            "query": q,
+            "exact": [],
+            "masked": [],
+            "partial": [],
+            "total": 0,
+        });
+    }
+    // 片段匹配用的归一串：去掉空白并转小写。
+    // 注意「完全一致」不能用它——key 里有大写字母（sk-…ZZ），
+    // 拿小写串去比原文永远比不上，会把确定命中降级成片段候选。
+    let needle: String = q
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+
+    let locked = !secrets::available();
+    let mut exact: Vec<Value> = Vec::new();
+    let mut by_masked: Vec<Value> = Vec::new();
+    let mut partial: Vec<Value> = Vec::new();
+
+    for p in sites() {
+        let sid = p["id"].as_str().unwrap_or("").to_string();
+        let sname = p["name"].as_str().unwrap_or("").to_string();
+        let shome = p["homepage"].as_str().unwrap_or("").to_string();
+        let skind = p["kind"].as_str().unwrap_or("").to_string();
+        let base = base_for(&p, &Value::Null);
+        for k in p["keys"].as_array().cloned().unwrap_or_default() {
+            let plain = k["key"].as_str().unwrap_or("").trim().to_string();
+            let masked = k["masked"].as_str().unwrap_or("").trim().to_string();
+            if plain.is_empty() && masked.is_empty() {
+                continue;
+            }
+            let entry = json!({
+                "site": sid,
+                "site_name": sname,
+                "site_kind": skind,
+                "homepage": shome,
+                "base_url": base,
+                "id": k["id"],
+                "label": k["label"],
+                "masked": masked,
+                "source": k["source"],
+                "note": k["note"],
+                "expires_on": k["expires_on"],
+                "use_in_proxy": k["use_in_proxy"],
+                "last_status": k["last_status"],
+                "last_check": k["last_check"],
+                "models": k["models"],
+                "has_plain": !plain.is_empty(),
+            });
+
+            // 三档匹配：先严后宽，命中即止（一把 key 只归一档）
+            match tier_of(&plain, &masked, q, &needle) {
+                Some(KeyTier::Exact) => exact.push(entry),
+                Some(KeyTier::Masked) => by_masked.push(entry),
+                Some(KeyTier::Partial) => partial.push(entry),
+                None => {}
+            }
+        }
+    }
+
+    let total = exact.len() + by_masked.len() + partial.len();
+    json!({
+        "ok": true,
+        "locked": locked,
+        "query": q,
+        "exact": exact,
+        "masked": by_masked,
+        "partial": partial,
+        "total": total,
+    })
 }
 
 /// 按 key 原文给全台账查重：同一个 key 出现 ≥2 条就算一组（跨站/同站都算）。
@@ -898,26 +1134,140 @@ fn upstream_hint(body: &str) -> String {
 /// 为什么需要它：`probe()` 打的是 `.../models`，有的站点这个接口**不校验 key**
 /// （谁问都给模型清单），于是一把根本用不了的 key 也会显示「可用」——小红书 Dots
 /// 就是这么骗过测试的（2026-11-05 实测：假 key 与不带 key 都返回 200，真发对话才 403）。
-/// 只有真发一次 `POST /chat/completions` 才知道上游认不认这把 key。
+/// 只有真发一次对话才知道上游认不认这把 key。
 ///
 /// 返回 (可用?, 说明)。说明里带耗时和上游原话，失败时能一眼看出是 401 不认 key、
 /// 403 不让调，还是地址压根不是 OpenAI 兼容口。
-pub fn chat_probe(base_url: &str, key: &str, model: &str) -> (bool, String) {
+///
+/// `fmt` 是站点上这条接入点登记的兼容格式（UI 的 `sbase-fmt`，见 ui/app.js 的 BASE_FMT）。
+/// 2026-11-20 加：**`openai-resp` 必须走 Responses 协议**。星驰API（api.xingchiapi.com）
+/// 已经把 `/v1/chat/completions` 整条停用（回 `chat_completions_disabled`，让客户端改用
+/// `/v1/responses`），而原先这里一律拼 chat/completions，于是站点明明登记成
+/// 「OpenAI Responses」、地址也填的 `/v1/responses/`，点「请求」照样被 400 顶回来
+/// （她的截图就是这么来的）。格式登记了却不用，等于没登记。
+///
+/// 认不出 fmt 时保持老行为（chat/completions），别把没登记格式的站点搞坏。
+/// 一次（密钥 × 协议）探测的结构化结果。
+///
+/// `state` 直接给界面用，取值固定：
+///   `ok` 通 / `site_disabled` 站点停用该协议 / `key_denied` 密钥无权 /
+///   `model_mismatch` 模型名不被接受 / `error` 其他错误。
+///
+/// 为什么要单列 `site_disabled`：星驰这类站把 `/v1/chat/completions` 整条停了，
+/// 那一列里每把密钥都会失败。若一律标成「密钥无权」，三行全红会被读成
+/// 「三把 key 都坏了」，实际是站点没开这个协议——结论完全不同。
+pub struct ProbeOutcome {
+    pub state: &'static str,
+    pub code: u16,
+    pub ms: u128,
+    pub said: String,
+    pub hint: String,
+    pub extra: &'static str,
+    /// 传输层失败（连不上/超时）：此时 code 为 0，`hint` 是翻译过的人话。
+    pub net_err: bool,
+}
+
+impl ProbeOutcome {
+    fn fail(state: &'static str, code: u16, ms: u128, hint: impl Into<String>) -> Self {
+        ProbeOutcome {
+            state,
+            code,
+            ms,
+            said: String::new(),
+            hint: hint.into(),
+            extra: "",
+            net_err: false,
+        }
+    }
+}
+
+/// 按 HTTP 状态码与上游原话判失败性质。
+///
+/// 400 的三种写法要分开：「停用接口」「模型不认」「其他」。前两种的处置完全不同
+/// （换协议 / 先取模型清单），糊成一句「请求被拒」等于没说。
+fn classify_failure(code: u16, body: &str) -> &'static str {
+    let low = body.to_ascii_lowercase();
+    let disabled = low.contains("chat_completions_disabled")
+        || body.contains("已停用")
+        || low.contains("dispatch")
+        || low.contains("does not allow")
+        || low.contains("not allowed for this");
+    let model_bad = low.contains("model")
+        && (low.contains("not found")
+            || low.contains("does not exist")
+            || low.contains("unknown")
+            || low.contains("invalid"));
+    match code {
+        400 => {
+            if disabled {
+                "site_disabled"
+            } else if model_bad {
+                "model_mismatch"
+            } else {
+                "error"
+            }
+        }
+        // 401 鉴权失败、403 不允许调、429 额度用尽：都归到这把 key 身上
+        401 | 403 | 429 => "key_denied",
+        // 404 多半是这个地址根本没有该协议的接口
+        404 => "site_disabled",
+        _ => "error",
+    }
+}
+
+/// 真发一次最小对话，返回结构化结果（矩阵与单点检测共用这一份实现）。
+pub fn probe_combo(
+    base_url: &str,
+    key: &str,
+    model: &str,
+    fmt: &str,
+    timeout_secs: u64,
+) -> ProbeOutcome {
+    // 地址本身带 /responses 的，就算 fmt 没登记也按 Responses 打——
+    // 用户已经把「我要走这个协议」写在地址里了，不该再被改成 chat。
+    let wants_responses = fmt.eq_ignore_ascii_case("openai-resp")
+        || base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+            .ends_with("/responses");
     let base = strip_action_suffix(base_url.trim()).trim_end_matches('/');
-    let url = match chat_url(base) {
-        Some(u) => u,
-        None => return (false, "未填 Base URL".into()),
+    let (url, body) = if wants_responses {
+        match responses_url(base) {
+            Some(u) => (
+                u,
+                json!({
+                    "model": model,
+                    "input": "ping",
+                    "max_output_tokens": 16,
+                    "stream": false,
+                }),
+            ),
+            None => return ProbeOutcome::fail("error", 0, 0, "未填 Base URL"),
+        }
+    } else {
+        match chat_url(base) {
+            Some(u) => (
+                u,
+                json!({
+                    "model": model,
+                    "messages": [{ "role": "user", "content": "ping" }],
+                    "max_tokens": 1,
+                    "stream": false,
+                }),
+            ),
+            None => return ProbeOutcome::fail("error", 0, 0, "未填 Base URL"),
+        }
     };
-    let body = json!({
-        "model": model,
-        "messages": [{ "role": "user", "content": "ping" }],
-        "max_tokens": 1,
-        "stream": false,
-    });
     let t0 = std::time::Instant::now();
     let mut req = ureq::post(&url)
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .set("Content-Type", "application/json");
+    // ureq 默认 UA 是 `ureq/x.y`，有些中转站按 UA 首 token 放行（星驰只认
+    // WorkBuddy / Codex / Claude Code 这类编程客户端，裸脚本一律 403 client_not_allowed）。
+    // 检测的意义是「验证这把 key 在这个站能不能用」，不是「验证 ureq 能不能用」，
+    // 所以这里声明成 WorkBuddy——和真正调用它的客户端一致，测出来的结论才作数。
+    req = req.set("User-Agent", PROBE_UA);
     if !key.is_empty() {
         req = req.set("Authorization", &format!("Bearer {}", key));
         // Anthropic 系的口认 x-api-key 不认 Bearer；多带一个头对 OpenAI 系没影响
@@ -928,17 +1278,40 @@ pub fn chat_probe(base_url: &str, key: &str, model: &str) -> (bool, String) {
             let ms = t0.elapsed().as_millis();
             let txt = resp.into_string().unwrap_or_default();
             let v: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
-            let said = v["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or("")
-                .replace(['\n', '\r'], " ");
-            let said: String = said.trim().chars().take(40).collect();
-            let msg = if said.is_empty() {
-                format!("真请求通过（{}ms）：上游收下了这把 key（模型 {model}）", ms)
+            // 两种协议的返回体长得不一样：
+            //   chat      -> choices[0].message.content
+            //   responses -> output[].content[].text（output_text 类型）
+            let said = if wants_responses {
+                v["output"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|it| it["content"].as_array())
+                            .flatten()
+                            .filter(|c| c["type"].as_str() == Some("output_text"))
+                            .filter_map(|c| c["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default()
             } else {
-                format!("真请求通过（{}ms）：模型 {model} 回了「{said}」", ms)
-            };
-            (true, msg)
+                v["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            }
+            .replace(['\n', '\r'], " ");
+            let said: String = said.trim().chars().take(40).collect();
+            ProbeOutcome {
+                state: "ok",
+                code: 200,
+                ms,
+                said,
+                hint: String::new(),
+                extra: "",
+                net_err: false,
+            }
         }
         Err(ureq::Error::Status(code, resp)) => {
             let txt = resp.into_string().unwrap_or_default();
@@ -947,14 +1320,128 @@ pub fn chat_probe(base_url: &str, key: &str, model: &str) -> (bool, String) {
                 400 => "：请求被拒，通常是模型名这个接入点不认",
                 401 => "：这把 key 上游不认（鉴权失败）",
                 403 => "：上游认得出 key，但不允许它调这个模型",
+                404 if wants_responses => "：这个地址没有 /responses，确认兼容格式选对了没",
                 404 => "：这个地址没有 /chat/completions，可能不是 OpenAI 兼容口",
                 429 => "：限流，或这把 key 的额度用完了",
                 _ => "",
             };
-            (false, format!("真请求失败（HTTP {code}{extra}）{hint}"))
+            ProbeOutcome {
+                state: classify_failure(code, &txt),
+                code,
+                ms: t0.elapsed().as_millis(),
+                said: String::new(),
+                hint,
+                extra,
+                net_err: false,
+            }
         }
-        Err(e) => (false, friendly_net_err(&e, 20)),
+        Err(e) => ProbeOutcome {
+            state: "error",
+            code: 0,
+            ms: t0.elapsed().as_millis(),
+            said: String::new(),
+            hint: friendly_net_err(&e, timeout_secs),
+            extra: "",
+            net_err: true,
+        },
     }
+}
+
+/// 单点检测（「请求」按钮）：沿用原来的两元组与文案，内部走 `probe_combo`。
+pub fn chat_probe(base_url: &str, key: &str, model: &str, fmt: &str) -> (bool, String) {
+    let o = probe_combo(base_url, key, model, fmt, 20);
+    if o.net_err {
+        return (false, o.hint);
+    }
+    if o.state == "ok" {
+        let msg = if o.said.is_empty() {
+            format!("真请求通过（{}ms）：上游收下了这把 key（模型 {model}）", o.ms)
+        } else {
+            format!("真请求通过（{}ms）：模型 {model} 回了「{}」", o.ms, o.said)
+        };
+        (true, msg)
+    } else {
+        (
+            false,
+            format!("真请求失败（HTTP {}{}）{}", o.code, o.extra, o.hint),
+        )
+    }
+}
+
+/// 矩阵里的一格：谁 × 哪种协议 × 结果。
+pub struct MatrixCell {
+    pub key_id: String,
+    pub fmt: String,
+    pub state: &'static str,
+    pub code: u16,
+    pub ms: u128,
+    pub msg: String,
+}
+
+/// 批量探测：把任务摊到固定数量的工作线程上。
+///
+/// 为什么必须并发：一个 10 密钥 × 3 协议的站是 30 次请求，串行按 20 秒超时算
+/// 最坏要等十分钟，界面上就是「点了没反应」。并发上限压在 6，既快又不至于
+/// 把中转站的限流打爆。
+pub fn probe_matrix(
+    jobs: Vec<(String, String, String, String, String)>,
+    timeout_secs: u64,
+    workers: usize,
+) -> Vec<MatrixCell> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let total = jobs.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let jobs = std::sync::Arc::new(jobs);
+    let cursor = AtomicUsize::new(0);
+    let out: Mutex<Vec<Option<MatrixCell>>> = Mutex::new((0..total).map(|_| None).collect());
+    let n = workers.clamp(1, total).min(6);
+
+    std::thread::scope(|s| {
+        for _ in 0..n {
+            s.spawn(|| loop {
+                let i = cursor.fetch_add(1, Ordering::SeqCst);
+                if i >= total {
+                    break;
+                }
+                let (key_id, fmt, url, key, model) = &jobs[i];
+                let o = probe_combo(url, key, model, fmt, timeout_secs);
+                let msg = if o.net_err {
+                    o.hint.clone()
+                } else if o.state == "ok" {
+                    if o.said.is_empty() {
+                        "连通".to_string()
+                    } else {
+                        format!("返回「{}」", o.said)
+                    }
+                } else {
+                    let h = o.hint.trim_start_matches("；上游说：");
+                    if h.is_empty() {
+                        format!("HTTP {}", o.code)
+                    } else {
+                        format!("HTTP {}：{}", o.code, h)
+                    }
+                };
+                out.lock().unwrap()[i] = Some(MatrixCell {
+                    key_id: key_id.clone(),
+                    fmt: fmt.clone(),
+                    state: o.state,
+                    code: o.code,
+                    ms: o.ms,
+                    msg,
+                });
+            });
+        }
+    });
+
+    out.into_inner()
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// 网络错误翻译成人话：超时（Windows 上表现为 os error 10060）要说清
@@ -1022,6 +1509,91 @@ pub fn probe_models(base_url: &str, key: &str) -> (bool, String, Vec<String>) {
     }
 }
 
+/// 一个站点常有多个接入点（OpenAI 兼容 / Anthropic 兼容 / DashScope…）。
+/// 界面上「获取模型」全站只留一个入口，那它就得把这些口都问一遍——
+/// 只问第一口，登记顺序把 Responses 排在前面的站会显示「没拉到模型」，
+/// 而其实是那个口拿不到清单、另一个口本来就正常。
+///
+/// 每个口按密钥顺序试到一把能用的为止：有的站某把密钥只对某个口开放，
+/// 从头到尾只用第一把，那一整口都会判死。
+/// 返回（去重合并后的模型 id，逐口说明）。
+pub fn probe_models_all(site: &Value) -> (Vec<String>, Vec<String>) {
+    let mut ids: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+
+    let keys: Vec<String> = site["keys"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|k| k["key"].as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 同一个地址登记两遍（不同格式标签）不该发两次请求
+    let mut bases: Vec<(String, String)> = Vec::new();
+    for b in site["base_urls"].as_array().into_iter().flatten() {
+        let url = b["url"].as_str().unwrap_or("").trim().to_string();
+        if url.is_empty() || bases.iter().any(|(u, _)| *u == url) {
+            continue;
+        }
+        bases.push((url, b["format"].as_str().unwrap_or("openai").to_string()));
+    }
+    if bases.is_empty() {
+        return (ids, vec!["这个站点还没登记接入点".into()]);
+    }
+
+    for (url, fmt) in &bases {
+        let label = match fmt.as_str() {
+            "openai" => "OpenAI 兼容".to_string(),
+            "anthropic" => "Anthropic 兼容".to_string(),
+            "dashscope" => "DashScope".to_string(),
+            "openai-resp" => "OpenAI Responses".to_string(),
+            other => other.to_string(),
+        };
+        // 一把密钥都没有时用空 key 试一次：有的站 /models 不校验
+        let attempts: Vec<String> = if keys.is_empty() {
+            vec![String::new()]
+        } else {
+            keys.clone()
+        };
+        let mut got: Option<Vec<String>> = None;
+        let mut last = String::new();
+        let mut which = 0usize;
+        for (i, k) in attempts.iter().enumerate() {
+            let (good, msg, list) = probe_models(url, k);
+            if good {
+                got = Some(list);
+                which = i + 1;
+                break;
+            }
+            last = msg;
+        }
+        match got {
+            Some(list) => {
+                let n = list.len();
+                let mut added = 0;
+                for m in list {
+                    if !ids.iter().any(|x| *x == m) {
+                        ids.push(m);
+                        added += 1;
+                    }
+                }
+                let who = if attempts.len() > 1 {
+                    format!("（第 {which} 把密钥）")
+                } else {
+                    String::new()
+                };
+                notes.push(format!("{label}：{n} 个，新增 {added}{who}"));
+            }
+            None => notes.push(format!("{label}：{last}")),
+        }
+    }
+    (ids, notes)
+}
+
 /// 从文档复制来的地址常常已经带上了动作后缀
 /// （…/v1/chat/completions、…/responses、…/v1/messages 之类）。
 /// 测活和拉模型要的是 API 根：先把这些后缀剥掉再拼 /models，
@@ -1073,6 +1645,26 @@ fn chat_url(base_url: &str) -> Option<String> {
         format!("{base}/chat/completions")
     } else {
         format!("{base}/v1/chat/completions")
+    })
+}
+
+/// Responses 协议真请求的地址（站点兼容格式登记成 `openai-resp` 时走这里）。
+/// 规矩和 chat_url 一样：先剥动作后缀，再看有没有版本尾巴。
+/// 2026-11-20 加，起因是星驰API 停用了 /v1/chat/completions。
+fn responses_url(base_url: &str) -> Option<String> {
+    let base = strip_action_suffix(base_url.trim()).trim_end_matches('/');
+    if base.is_empty() {
+        return None;
+    }
+    let has_version_tail = ["/v1", "/v1beta", "/v1beta1", "/v4"]
+        .iter()
+        .any(|s| base.ends_with(s));
+    Some(if base.ends_with("/responses") {
+        base.to_string()
+    } else if has_version_tail {
+        format!("{base}/responses")
+    } else {
+        format!("{base}/v1/responses")
     })
 }
 
@@ -1307,6 +1899,164 @@ mod tests {
         assert_eq!(chat_url("   ").as_deref(), None);
     }
 
+    /// Responses 协议的地址归一：登记成 openai-resp 的站要打 /responses，
+    /// 不能被打成 /chat/completions（星驰API 已停用 chat，2026-11-20）。
+    #[test]
+    fn responses_url_normalizes_like_chat() {
+        // 星驰截图里的地址：带尾斜杠 + 已经带 /responses
+        assert_eq!(
+            responses_url("https://api.xingchiapi.com/v1/responses/").as_deref(),
+            Some("https://api.xingchiapi.com/v1/responses"),
+            "已经带 /responses 的不许再叠一层"
+        );
+        assert_eq!(
+            responses_url("https://api.xingchiapi.com/v1").as_deref(),
+            Some("https://api.xingchiapi.com/v1/responses")
+        );
+        assert_eq!(
+            responses_url("https://api.example.com").as_deref(),
+            Some("https://api.example.com/v1/responses")
+        );
+        // 关键：chat 的地址交给 responses_url，必须换成 /responses 而不是原样返回
+        assert_eq!(
+            responses_url("https://api.example.com/v1/chat/completions").as_deref(),
+            Some("https://api.example.com/v1/responses")
+        );
+        assert_eq!(responses_url("   ").as_deref(), None);
+    }
+
+    /// 地址和格式必须同源：只登记了 Responses 口的站，base_for 不能掉到
+    /// 「随便第一条」去，否则拿 A 口的地址配 B 口的协议。
+    #[test]
+    fn base_and_fmt_pairs_url_with_its_format() {
+        // 星驰的实际情况：只有一条 openai-resp
+        let only_resp = json!({
+            "base_urls": [{ "format": "openai-resp", "url": "https://api.xingchiapi.com/v1/responses" }]
+        });
+        assert_eq!(
+            base_and_fmt(&only_resp, &json!({})),
+            (
+                "https://api.xingchiapi.com/v1/responses".to_string(),
+                "openai-resp".to_string()
+            ),
+            "只登记 Responses 口时也要选中它，并带回格式"
+        );
+
+        // 同时有 chat 和 resp：优先 chat（老行为不变），格式跟着地址走
+        let both = json!({
+            "base_urls": [
+                { "format": "openai-resp", "url": "https://x/v1/responses" },
+                { "format": "openai", "url": "https://x/v1" },
+            ]
+        });
+        assert_eq!(
+            base_and_fmt(&both, &json!({})),
+            ("https://x/v1".to_string(), "openai".to_string())
+        );
+
+        // key 上覆盖地址时，格式取 key 自己的
+        assert_eq!(
+            base_and_fmt(
+                &only_resp,
+                &json!({ "base_url": "https://mine/v1", "base_format": "openai-resp" })
+            ),
+            ("https://mine/v1".to_string(), "openai-resp".to_string())
+        );
+        // key 覆盖地址但没写格式：退回站点第一条格式
+        assert_eq!(
+            base_and_fmt(&only_resp, &json!({ "base_url": "https://mine/v1" })),
+            ("https://mine/v1".to_string(), "openai-resp".to_string())
+        );
+
+        // 空站点
+        assert_eq!(
+            base_and_fmt(&json!({}), &json!({})),
+            (String::new(), String::new())
+        );
+        // base_for 与 base_and_fmt 的地址必须一致（前者是后者的薄包装）
+        assert_eq!(base_for(&only_resp, &json!({})), "https://api.xingchiapi.com/v1/responses");
+    }
+
+    /// 协议判定的核心：fmt=openai-resp 或地址自带 /responses 都要走 Responses。
+    /// 这条规则写在 chat_probe 里，抽出来单测，避免真发网络请求。
+    #[test]
+    fn wants_responses_covers_format_and_url() {
+        let wants = |fmt: &str, url: &str| {
+            fmt.eq_ignore_ascii_case("openai-resp")
+                || url.trim().trim_end_matches('/').to_ascii_lowercase().ends_with("/responses")
+        };
+        assert!(wants("openai-resp", "https://api.xingchiapi.com/v1"));
+        assert!(wants("OpenAI-Resp", "https://x/v1"), "格式名大小写不该影响判断");
+        assert!(wants("", "https://api.xingchiapi.com/v1/responses/"), "地址写明了就照办");
+        assert!(!wants("openai", "https://x/v1"), "普通 chat 站保持老行为");
+        assert!(!wants("", "https://x/v1"));
+    }
+
+    /// 失败归因必须把「站点停用这个协议」和「这把密钥不行」分开。
+    /// 混成一句「请求失败」，三行全红的矩阵会被读成「三把 key 都坏了」。
+    #[test]
+    fn classify_failure_separates_protocol_from_key() {
+        assert_eq!(
+            classify_failure(
+                400,
+                r#"{"error":{"code":"chat_completions_disabled","message":"本站已停用 /v1/chat/completions"}}"#
+            ),
+            "site_disabled"
+        );
+        assert_eq!(
+            classify_failure(400, r#"{"error":{"message":"This group does not allow /v1/messages dispatch"}}"#),
+            "site_disabled"
+        );
+        assert_eq!(
+            classify_failure(400, r#"{"error":{"message":"model gpt-x not found"}}"#),
+            "model_mismatch"
+        );
+        assert_eq!(classify_failure(400, r#"{"error":{"message":"bad request"}}"#), "error");
+        assert_eq!(classify_failure(401, "unauthorized"), "key_denied");
+        assert_eq!(classify_failure(403, "forbidden"), "key_denied");
+        assert_eq!(classify_failure(429, "slow down"), "key_denied");
+        assert_eq!(classify_failure(404, ""), "site_disabled");
+        assert_eq!(classify_failure(500, ""), "error");
+    }
+
+    /// 密钥自带接入点时，要靠地址反推它属于矩阵的哪一列；
+    /// 推错就会拿 Responses 的地址去打 chat 的口。
+    #[test]
+    fn fmt_of_url_reads_the_protocol_from_the_path() {
+        assert_eq!(fmt_of_url("https://api.xingchiapi.com/v1/responses"), "openai-resp");
+        assert_eq!(fmt_of_url("https://api.xingchiapi.com/v1/responses/"), "openai-resp");
+        assert_eq!(fmt_of_url("https://x/v1/messages"), "anthropic");
+        assert_eq!(fmt_of_url("https://x/v1/chat/completions"), "openai");
+        assert_eq!(fmt_of_url("https://x/openai/v1"), "openai");
+        assert_eq!(fmt_of_url("https://generativelanguage.googleapis.com/v1beta"), "gemini");
+    }
+
+    /// 列来自站点登记的接入点；站点没登记时退回密钥自带地址，别让弹窗空着。
+    #[test]
+    fn matrix_columns_prefers_site_then_falls_back_to_keys() {
+        let site = json!({"base_urls": [
+            {"format": "openai-resp", "url": "https://a/v1/responses"},
+            {"format": "openai",      "url": "https://a/v1"},
+            {"format": "openai",      "url": "https://a/v1-duplicate"},
+            {"format": "anthropic",   "url": "  "}
+        ]});
+        let cols = matrix_columns(&site);
+        assert_eq!(cols.len(), 2, "同一格式只占一列，空地址要跳过");
+        assert_eq!(cols[0], ("openai-resp".to_string(), "https://a/v1/responses".to_string()));
+        assert_eq!(cols[1], ("openai".to_string(), "https://a/v1".to_string()));
+
+        let only_keys = json!({"keys": [
+            {"base_url": "https://b/v1/responses"},
+            {"base_url": ""},
+            {"base_url": "https://b/v1/responses"}
+        ]});
+        let c2 = matrix_columns(&only_keys);
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0].0, "openai-resp");
+
+        assert!(matrix_columns(&json!({})).is_empty());
+    }
+
     /// 上游报错的写法五花八门：网关一套、OpenAI 一套，抠不出 JSON 时也得截一段给看。
     /// 只有「HTTP 403」三个字等于没说——她要的是「到底谁不放行」。
     #[test]
@@ -1368,5 +2118,87 @@ mod tests {
     fn mask_short_and_long() {
         assert_eq!(mask("short"), "••••");
         assert_eq!(mask("sk-proj-0000000000000000abcd"), "sk-pro••••abcd");
+    }
+
+    /// 找密钥：三档匹配（原文全等 / 打码全等 / 片段包含）各归各的档，
+    /// 不能把「片段命中」混进「完全一致」——那会让用户拿候选当定论去用。
+    /// 这里只测纯匹配规则，不碰全局存储：并行跑测试时 store_override 是共享的，
+    /// 一旦两个用例各写各的临时目录就会互相覆盖。
+    #[test]
+    fn tier_of_matches_in_three_tiers() {
+        let full = "sk-abcdef0123456789ZZ";
+        let masked = "sk-abc••••78ZZ";
+        // 片段串是归一过的（小写无空白）；query 是用户原样输入
+        let q = full.to_string();
+        let needle = "abcdef0123".to_string();
+
+        // ① 完整原文 → 完全一致
+        assert_eq!(
+            tier_of(full, masked, &q, &needle),
+            Some(KeyTier::Exact)
+        );
+        // ② 打码形式 → 打码一致（不是完全一致）
+        assert_eq!(
+            tier_of(full, masked, masked, &needle),
+            Some(KeyTier::Masked)
+        );
+        // ③ 片段 → 片段匹配，且不能同时算作完全一致
+        assert_eq!(
+            tier_of(full, masked, "abcdef0123", &needle),
+            Some(KeyTier::Partial)
+        );
+        // 查无此 key → 不命中
+        assert_eq!(
+            tier_of(full, masked, "sk-does-not-exist", "sk-does-not-exist"),
+            None
+        );
+        // 空输入 → 不命中
+        assert_eq!(tier_of(full, masked, "", ""), None);
+    }
+
+    /// 大写字母的 key 必须还能被「完全一致」认出来：
+    /// 全等比较若拿小写归一串去比原文，永远比不上，会把确定命中降级成片段候选。
+    #[test]
+    fn tier_of_exact_is_case_sensitive_on_the_original() {
+        let full = "sk-abcdef0123456789ZZ";
+        let masked = "sk-abc••••78ZZ";
+        let needle = "sk-abcdef0123456789zz".to_string(); // 归一后的小写
+        assert_eq!(
+            tier_of(full, masked, full, &needle),
+            Some(KeyTier::Exact),
+            "原文全等应按用户原样输入比对，不能用小写归一串"
+        );
+    }
+
+    /// 锁箱时只有打码串：片段要两头都对上才算命中，
+    /// 只靠一头（4 个字符满地都是）会误报一片。
+    #[test]
+    fn tier_of_locked_needs_both_ends() {
+        let masked = "sk-abc••••78ZZ";
+        // 两头都有 → 命中
+        assert_eq!(
+            tier_of("", masked, "sk-abc78zz", "sk-abc78zz"),
+            Some(KeyTier::Partial)
+        );
+        // 只有一头 → 不命中
+        assert_eq!(tier_of("", masked, "sk-abc", "sk-abc"), None);
+        assert_eq!(tier_of("", masked, "78zz", "78zz"), None);
+        // 片段太短 → 不命中
+        assert_eq!(tier_of("", masked, "skabc78zz", "skabc78zz"), None);
+    }
+
+    /// 片段比对忽略大小写与空白：key 常从 PDF、聊天记录里复制，中间带换行空格。
+    #[test]
+    fn tier_of_ignores_case_and_whitespace() {
+        let full = "sk-abcdef0123456789ZZ";
+        let masked = "sk-abc••••78ZZ";
+        assert_eq!(
+            tier_of(full, masked, "ABCDEF0123", "abcdef0123"),
+            Some(KeyTier::Partial)
+        );
+        assert_eq!(
+            tier_of(full, masked, "abcdef 0123", "abcdef0123"),
+            Some(KeyTier::Partial)
+        );
     }
 }

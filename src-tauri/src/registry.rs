@@ -202,7 +202,10 @@ pub fn apps() -> Vec<AppDef> {
             "{PROGRAMFILES}/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
             "{LOCALAPPDATA}/Microsoft/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/ChatGPT.exe",
         ], "", Some("{APPDATA}/Codex/web/Codex"), true),
-        curated("claude", "Claude Code CLI", "cli", &["{APPDATA}/npm/claude.cmd"], "CLAUDE_CONFIG_DIR", Some(".claude"), true),
+        curated("claude", "Claude Code CLI", "cli", &[
+            "{APPDATA}/npm/claude.cmd",
+            "{USERPROFILE}/.local/bin/claude.exe",
+        ], "CLAUDE_CONFIG_DIR", Some(".claude"), true),
         // Claude 桌面版包含 Cowork / Code；Claude-3p 是它自行管理的资料目录，
         // 不能当安装目录或换号档案。保留官方包身份启动，不复制/接管这份资料。
         curated("claude-desktop", "Claude 桌面版", "plain", &[
@@ -1809,6 +1812,28 @@ pub fn find_instance(app_id: &str, name: &str) -> Option<Value> {
     load_instances(app_id)
         .into_iter()
         .find(|m| m["name"].as_str() == Some(name))
+}
+
+/// 账号卡「隐藏」标记（她 2026-11-12：某个号暂时不用了，先灰掉、别再查也别再自动签）。
+/// 只改驾驶舱自己这张卡的记录，**不动档案目录、不碰登录包**——恢复时一切照旧。
+/// 存成 `hidden: true` 字段（false 直接删字段，老版本读到的仍是"没这个键"）。
+pub fn set_instance_hidden(app_id: &str, name: &str, hide: bool) -> Result<(), String> {
+    let mut m = find_instance(app_id, name)
+        .ok_or_else(|| format!("找不到「{name}」这张账号卡（可能已被改名或删除）"))?;
+    if m["hidden"].as_bool() == Some(hide) {
+        return Ok(());
+    }
+    match m.as_object_mut() {
+        Some(o) => {
+            if hide {
+                o.insert("hidden".into(), json!(true));
+            } else {
+                o.remove("hidden");
+            }
+        }
+        None => return Err("账号记录格式不对".to_string()),
+    }
+    save_instance_checked(app_id, &m)
 }
 
 /// 账号名直接当文件名用（`instances/<产品>/<名字>.json`），Windows 文件名禁用的

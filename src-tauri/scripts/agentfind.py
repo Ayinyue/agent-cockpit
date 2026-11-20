@@ -102,11 +102,14 @@ def attach_log():
         sys.stdout = sys.stderr = stream
 
 
-def _meta_at(port, timeout=3.0):
+def _identity_at(port, timeout=3.0):
+    """轻量身份接口：不碰数据库。自证/探活都走它——/api/meta 要现算 overview()，
+    索引库大或出错时慢到超时甚至回 500，曾把归我们的好端口误判成"影子绑定"、
+    漂完 10 口进程自杀（2026-11-19 实录：overview 里一处 NameError 就放倒了整个服务）。"""
     try:
-        with local_open(f"http://127.0.0.1:{port}/api/meta", timeout=timeout) as r:
-            meta = json.loads(r.read().decode("utf-8"))
-        return meta if isinstance(meta, dict) else None
+        with local_open(f"http://127.0.0.1:{port}/api/agentfind", timeout=timeout) as r:
+            info = json.loads(r.read().decode("utf-8"))
+        return info if isinstance(info, dict) and info.get("service") == "AgentFind" else None
     except Exception:
         return None
 
@@ -114,8 +117,7 @@ def _meta_at(port, timeout=3.0):
 def already_running(port):
     """本机端口上已有 AgentFind 在跑就返回 True（避免重复启动去抢同一个端口）。"""
     for _ in range(2):
-        meta = _meta_at(port)
-        if meta and "total" in meta:
+        if _identity_at(port):
             return True
     return False
 
@@ -127,13 +129,10 @@ def is_me_running(port):
     所以 bind() 成功不等于抢到端口。2026-10-29 实录：qwenwork-bridge 先占了 8765，
     agentfind 影子绑在同一个口上，进程活着、端口"在听"、一个请求都收不到，
     桌面启动器探到的是桥的 404，于是弹"等了 12 秒服务端口还是没响应"。
-
-    要重试而不是单发一次：/api/meta 首次得现算一遍 overview()，实测冷启动 2.9s，
-    探得太急会把本来就归我们的好端口误判成"没抢到"，白往后漂。
     """
     for attempt in range(VERIFY_TRIES):
-        meta = _meta_at(port, timeout=VERIFY_TIMEOUT)
-        if meta and meta.get("pid") == os.getpid():
+        info = _identity_at(port, timeout=VERIFY_TIMEOUT)
+        if info and info.get("pid") == os.getpid():
             return True
         if attempt < VERIFY_TRIES - 1:
             time.sleep(0.3)
@@ -495,8 +494,18 @@ def discover_sources():
     # AStudio（Acode / 科大讯飞星辰）：rollout JSONL 在 acode-home-overlay/sessions/
     astudio_home = os.environ.get("AGENTFIND_ASTUDIO_HOME")
     if not astudio_home:
-        local = os.environ.get("LOCALAPPDATA", "")
-        astudio_home = str(Path(local) / "Programs/AStudio Data/acode-home-overlay/sessions") if local else ""
+        # 独立版没有驾驶舱注入的环境变量：先在各个盘下找这个已知布局（安装盘由用户选，
+        # 不能写死盘符），再落 LOCALAPPDATA 默认位。
+        rel = Path("Artificial_Intelligence/AStudio Data/acode-home-overlay/sessions")
+        for drive in ("D", "E", "F", "G", "C"):
+            cand = Path(drive + ":/") / rel
+            if cand.exists():
+                astudio_home = str(cand)
+                break
+        if not astudio_home:
+            local = os.environ.get("LOCALAPPDATA", "")
+            if local:
+                astudio_home = str(Path(local) / "Programs/AStudio Data/acode-home-overlay/sessions")
     if astudio_home:
         add("astudio", "AStudio", "astudio_rollout", [Path(astudio_home)])
 
@@ -508,7 +517,7 @@ def discover_sources():
         "qoder-cn-ide": [HOME / ".qoder-cn-ide/projects"],
         "workbuddy": [HOME / ".workbuddy/projects"],
         "workbuddy-intl": [HOME / ".workbuddy-ai/projects"],
-        "astudio": [astudio_sessions],
+        "astudio": [Path(astudio_home)] if astudio_home else [],
         "minimax": [HOME / ".minimax/sessions"],
         "traework-cn": [HOME / ".trae-cn/memory/projects"],
         "zcode": [HOME / ".zcode/cli/db/db.sqlite"],
@@ -2265,7 +2274,7 @@ def serve(port, open_browser, initial_query):
                     self._json(desktop_feed(read_con()))
                 elif u.path == "/api/agentfind":
                     self._json({"service": "AgentFind", "sessions_ui": 1,
-                                "script": SCRIPT_FINGERPRINT})
+                                "script": SCRIPT_FINGERPRINT, "pid": os.getpid()})
                 elif u.path == "/api/meta":
                     ov = overview(read_con())
                     ov.update(progress=STATE["progress"], ready=STATE["ready"], pid=os.getpid(),
@@ -2330,8 +2339,8 @@ def serve(port, open_browser, initial_query):
             srv = ThreadingHTTPServer(("127.0.0.1", cand), Handler)
         except OSError:
             continue
-        # 探活必须在后台扫描启动之前做：首轮 refresh 一边写库一边让人读 /api/meta，
-        # 慢到 3s 以上甚至回 500，探活就会把归我们的好端口误判成"没抢到"、白往后漂。
+        # 自证走不碰数据库的 /api/agentfind（带 pid），扫描写库再慢也不会把
+        # 归我们的好端口误判成"没抢到"、白往后漂。
         threading.Thread(target=srv.serve_forever,
                          kwargs={"poll_interval": 0.05}, daemon=True).start()
         if is_me_running(cand):
@@ -2367,9 +2376,9 @@ def serve(port, open_browser, initial_query):
 # 前端
 # --------------------------------------------------------------------------
 
-# T19 部分迁：728 行内嵌前端 PAGE 挪到独立静态资源 agentfind-page.html（纯搬运，
-# 字节不变）。脚本指纹仍按本文件字节算（_script_fingerprint），PAGE 内容不再计入
-# 脚本指纹——前端改动不再触发服务重启。加载失败时给一个最小错误页，不静默白屏。
+# T19 部分迁：内嵌前端 PAGE 挪到独立静态资源 agentfind-page.html（纯搬运，字节不变）。
+# 脚本指纹仍按本文件字节算（_script_fingerprint），PAGE 内容不再计入脚本指纹——
+# 前端改动不再触发服务重启。加载失败时给最小错误页，不静默白屏。
 def _load_page():
     try:
         return (Path(__file__).with_name("agentfind-page.html")).read_text(encoding="utf-8")
