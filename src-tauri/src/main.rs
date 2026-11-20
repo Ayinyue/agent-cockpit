@@ -64,6 +64,7 @@ mod state;
 mod storage;
 mod swap;
 mod traeproxy;
+mod trae_clean;
 mod usage;
 mod usage_dashboard;
 mod wbproxy;
