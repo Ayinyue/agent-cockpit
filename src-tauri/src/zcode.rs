@@ -27,6 +27,12 @@ fn plain(path: &Path) -> Result<(), String> {
     Ok(())
 }
 fn helper(request: Value) -> Result<Value, String> {
+    // T18：zcode-auth 已迁 Rust（zcode_auth::run，golden 钉住与 python 逐字段一致，
+    // 含 enc:v1: AES-GCM 跨语言解密）。原生路径免 python 冷启；失败回退 python。
+    match crate::zcode_auth::run(&request) {
+        Ok(v) => return Ok(v),
+        Err(_) => { /* 回退 python */ }
+    }
     let installed = reg::home().join(".agenthub/venv/Scripts/python.exe");
     let mut command = Command::new(if installed.is_file() { installed } else { PathBuf::from("python") });
     const BOOTSTRAP: &str = "import io,json,sys; p=json.loads(sys.stdin.buffer.read().decode('utf-8')); sys.stdin=io.TextIOWrapper(io.BytesIO(json.dumps(p['request']).encode('utf-8')),encoding='utf-8'); exec(compile(p['script'],'<ZCode credentials>','exec'),{'__name__':'__main__'})";
