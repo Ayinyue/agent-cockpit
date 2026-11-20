@@ -1,4 +1,8 @@
-// T17（阶段四）：usage-local 迁 Rust —— 第一阶段：codex 解析 + SQLite 增量缓存。
+// T17（阶段四）：usage-local 迁 Rust。
+// 第一阶段：codex 解析 + SQLite 增量缓存（8809178）。
+// 第二阶段（本批）：messages 系解析——claude/claude-code/qoder/qoder-cn/qoderwork/
+// qwenwork/qwenworkcn/workbuddy/workbuddy-intl/codebuddy/codebuddy-cn/minimax。
+// DB 系（zcode/opencode/marvis/astudio）、dsh/gemini 仍在 python（第三阶段）。
 //
 // 计划 §4.4.2 红线：**不做 1:1 翻译**。python 版每轮把整个事件缓存 json.loads/dumps
 // （67.8MB 单轮 ~7.7s，2026-11-18 实测）；这里借迁移换 SQLite：按源文件指纹
@@ -6,12 +10,14 @@
 //
 // 口径与 python usage-local.py 逐字段对齐（golden 测试钉住）：
 // - codex token_count 取累计终值差分；配额刷新重复帧跳过；last 兜底
+// - messages：session:messageId 分组、fragment 去重、CJK 可见文本估算、
+//   claude/minimax/standard 三种 usage 风格（wb/codebuddy 用 standard）
 // - 事件 id = sha256(identity)，identity 含 sorted-keys JSON（与 python json.dumps(sort_keys=True) 对齐）
 // - 按天归日用本机时区；date-only 不伪造午夜事件
 // - 聚合去重键 session|id，取 (exact,tokens) 最大者
 //
-// 范围：本阶段只迁 codex/chatgpt（后台热路径）；其余产品仍走 python（usage.rs 接线回退）。
-// claude/messages、zcode/opencode 等 DB 解析在后续批次。
+// 接线（usage.rs）：codex/chatgpt + messages 系走 Rust，失败回退 python；
+// DB 系/dsh/gemini 仍 python。python 回退路径不删，迁移期互为保底。
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -44,7 +50,70 @@ fn first_number(obj: &Value, keys: &[&str]) -> f64 {
     0.0
 }
 
-/// 与 python usage_tokens(style) 对齐；本阶段 codex 用 "codex"，兜底 "standard"。
+/// python 真值语义：None/0/""/False/[]/{} 为假，其余为真。
+/// messages 系解析里大量 `a or b or c` 链必须按这个口径取第一个真值。
+fn is_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+fn first_truthy<'a>(vals: &[Option<&'a Value>]) -> Option<&'a Value> {
+    vals.iter().flatten().copied().find(|v| is_truthy(v))
+}
+
+/// python str(value) 的 JSON 标量渲染：字符串原样；bool True/False；null "None"；
+/// 整数无小数点；整值浮点带 .0（python str(5.0)=="5.0"）。
+/// 容器按 python str(dict/list) 的插入序渲染——message_file 的分组键
+/// str(message_id) 在 id 缺失时会落到 item dict 上，必须逐字符对齐。
+fn py_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => if *b { "True".to_string() } else { "False".to_string() },
+        Value::Null => "None".to_string(),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() { i.to_string() }
+            else if let Some(u) = n.as_u64() { u.to_string() }
+            else {
+                let f = n.as_f64().unwrap_or(0.0);
+                if f == f.trunc() && f.abs() < 1e16 { format!("{:.1}", f) } else { format!("{}", f) }
+            }
+        }
+        Value::Array(a) => {
+            let parts: Vec<String> = a.iter().map(py_repr).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Object(o) => {
+            // serde_json Map 未启用 preserve_order 时按 key 排序，python dict 按插入序。
+            // 真实数据里 id 字段都在，dict 兜底极罕见；此分支仍按现有 Map 序渲染并留注。
+            let parts: Vec<String> = o.iter().map(|(k, val)| format!("{}: {}", py_repr(&json!(k)), py_repr(val))).collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+    }
+}
+
+/// python repr()（容器内元素用 repr：字符串带引号）。只覆盖 JSON 可表达的标量/容器。
+fn py_repr(v: &Value) -> String {
+    match v {
+        Value::String(s) => {
+            // python repr 优先单引号；含单引号且不含双引号时换双引号。这里按常见路径：
+            // 单引号包裹 + 反斜杠/单引号转义（真实 id/模型名不含引号，转义分支保守覆盖）。
+            if s.contains('\'') && !s.contains('"') {
+                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+            }
+        }
+        other => py_str(other),
+    }
+}
+
+/// 与 python usage_tokens(style) 对齐；codex 用 "codex"，messages 用 claude/minimax/standard。
 fn usage_tokens(usage: &Value, style: &str) -> (f64, f64, f64, f64) {
     if !usage.is_object() {
         return (0.0, 0.0, 0.0, 0.0);
@@ -57,7 +126,9 @@ fn usage_tokens(usage: &Value, style: &str) -> (f64, f64, f64, f64) {
     if read == 0.0 { read = number(cache_obj.get("read").unwrap_or(&Value::Null)); }
     if write == 0.0 { write = number(cache_obj.get("write").unwrap_or(&Value::Null)); }
     if read == 0.0 {
-        if let Some(details) = usage.get("prompt_tokens_details").or_else(|| usage.get("inputTokensDetails")) {
+        // python: details = usage.get("prompt_tokens_details") or usage.get("inputTokensDetails") or {}
+        // 真值链：空 dict 为假，会落到下一候选（不是「键存在即停」）。
+        if let Some(details) = first_truthy(&[usage.get("prompt_tokens_details"), usage.get("inputTokensDetails")]) {
             if details.is_object() {
                 read = first_number(details, &["cached_tokens", "cacheReadTokens"]);
             }
@@ -74,9 +145,30 @@ fn usage_tokens(usage: &Value, style: &str) -> (f64, f64, f64, f64) {
     (i, o, read + write, total)
 }
 
+/// 与 python datetime.fromisoformat(text.replace("Z","+00:00")).astimezone() 对齐：
+/// 先按带偏移的 RFC3339 解析；失败再按 naive（本机时区）解析常见 ISO 形态。
+/// python 3.14 的 fromisoformat 接受无时区/空格分隔/缺秒等形态，rfc3339 不接受，
+/// 这里补 naive 兜底，避免把合法本机时间戳误判为空。
+fn parse_iso_local(text: &str) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
+    let t = text.replace('Z', "+00:00");
+    if let Ok(dt) = DateTime::parse_from_rfc3339(&t) {
+        return Some(dt.with_timezone(&Local));
+    }
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f",
+                "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(&t, fmt) {
+            if let chrono::LocalResult::Single(dt) = Local.from_local_datetime(&naive) {
+                return Some(dt);
+            }
+        }
+    }
+    None
+}
+
 /// 本机时区归日（与 python local_day 对齐）：ISO 时间戳转本机日期；date-only 原样；数值 epoch 秒/毫秒。
 fn local_day(value: &Value) -> String {
-    use chrono::{DateTime, Local, TimeZone};
+    use chrono::{Local, TimeZone};
     match value {
         Value::Number(n) => {
             let mut v = n.as_f64().unwrap_or(0.0);
@@ -92,9 +184,7 @@ fn local_day(value: &Value) -> String {
                 return chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
                     .map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default();
             }
-            DateTime::parse_from_rfc3339(&text.replace('Z', "+00:00"))
-                .map(|t| t.with_timezone(&Local).format("%Y-%m-%d").to_string())
-                .unwrap_or_default()
+            parse_iso_local(text).map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_default()
         }
         _ => String::new(),
     }
@@ -102,7 +192,6 @@ fn local_day(value: &Value) -> String {
 
 /// 秒级精确时刻：只有真带时分秒才算（date-only 不伪造午夜尖峰）。
 fn precise_timestamp(value: &Value) -> Option<f64> {
-    use chrono::DateTime;
     match value {
         Value::Bool(_) | Value::Null => None,
         Value::Number(n) => {
@@ -115,8 +204,7 @@ fn precise_timestamp(value: &Value) -> Option<f64> {
             if text.len() <= 10 || !(text.contains('T') || text.contains(' ')) {
                 return None;
             }
-            let ms = DateTime::parse_from_rfc3339(&text.replace('Z', "+00:00"))
-                .ok()?.timestamp_millis() as f64;
+            let ms = parse_iso_local(text)?.timestamp_millis() as f64;
             if ms.is_finite() && ms > 0.0 { Some(ms / 1000.0) } else { None }
         }
         _ => None,
@@ -156,9 +244,185 @@ fn dumps_sorted(value: &Value) -> String {
     }
 }
 
-/// 事件行（与 python event() 对齐；本阶段 codex 无 estimated/duration/ttft）。
-fn event(identity: &str, session: &str, timestamp: &Value, model: &str, usage: &Value) -> Value {
-    let (i, o, cache, total) = usage_tokens(usage, "codex");
+/// 可见文本提取（与 python visible_text 对齐）：只认 text/input_text/output_text
+/// 与 tool_result.content；刻意排除 image/base64、reasoning 签名与序列化工具载荷。
+/// list 用 "\n" 连接非空部分。
+fn visible_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(visible_text).filter(|p| !p.is_empty()).collect();
+            parts.join("\n")
+        }
+        Value::Object(obj) => {
+            match obj.get("type").and_then(|t| t.as_str()) {
+                Some("text") | Some("input_text") | Some("output_text") => {
+                    // python str(value.get("text") or "")：真值链，非字符串真值走 str()
+                    match first_truthy(&[obj.get("text")]) {
+                        Some(v) => py_str(v),
+                        None => String::new(),
+                    }
+                }
+                Some("tool_result") => visible_text(obj.get("content").unwrap_or(&Value::Null)),
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// 字符启发式估算（与 python estimate 对齐，非 tokenizer）：
+/// CJK（含扩展 B 以上）约 1 token/字，其余约 4 字符/token，向上取整。
+fn estimate(text: &str) -> f64 {
+    if text.is_empty() { return 0.0; }
+    let mut cjk = 0usize;
+    let mut len = 0usize;
+    for ch in text.chars() {
+        len += 1;
+        let c = ch as u32;
+        if (0x2e80..=0x9fff).contains(&c) || (0xac00..=0xd7af).contains(&c)
+            || (0xf900..=0xfaff).contains(&c) || c >= 0x20000 {
+            cjk += 1;
+        }
+    }
+    (cjk as f64 + (len - cjk) as f64 / 4.0).ceil()
+}
+
+/// messages 系分组（与 python message_file 逐条对齐）：
+/// - session:messageId 分组，fragment 按 uuid/id/文本哈希去重
+/// - user 消息累计 pending_input，归入下一条 assistant 组
+/// - usage 取组内 total 最大帧；无 usage 用可见文本估算顶替
+/// - style：wb/codebuddy 系 standard、minimax 用 minimax、其余 claude
+struct MsgGroup {
+    input_estimate: f64,
+    fragments: HashMap<String, f64>,
+    usage: Value,
+    timestamp: Value,
+    model: Value,
+    provider: Value,
+}
+
+pub fn message_file(path: &Path, app: &str) -> Result<Vec<Value>, String> {
+    let text = read_text_replace(path)?;
+    let file_name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let parent_name = path.parent().and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let mut session = if file_name != "messages.jsonl" { stem } else { parent_name };
+    let mut model = Value::Null;
+    let mut pending_input = 0.0f64;
+    let is_wb = matches!(app, "workbuddy" | "workbuddy-intl" | "codebuddy" | "codebuddy-cn");
+    let style = if is_wb { "standard" } else if app == "minimax" { "minimax" } else { "claude" };
+    // 保序分组：python dict 按首次插入序遍历，这里用 Vec 键序 + HashMap 存组。
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, MsgGroup> = HashMap::new();
+    // python enumerate(json_lines)：index 只数成功解析的 dict 行（坏行在 yield 前跳过）。
+    // 用原始行号会在「坏行 + 无 id 消息」时让 index 兜底分组键漂移。
+    let mut index = 0usize;
+    for line in py_lines(&text) {
+        let Ok(item) = serde_json::from_str::<Value>(line) else { continue };
+        if !item.is_object() { continue; }
+        let cur_index = index;
+        index += 1;
+        if let Some(s) = first_truthy(&[item.get("sessionId"), item.get("session_id")]) {
+            session = py_str(s);
+        }
+        let typ = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let message = item.get("message").filter(|m| m.is_object()).unwrap_or(&item);
+        let provider = item.get("providerData").filter(|p| p.is_object()).cloned().unwrap_or(json!({}));
+        if typ == "runtime-config" {
+            if let Some(m) = first_truthy(&[item.get("model")]) { model = m.clone(); }
+            continue;
+        }
+        let role = first_truthy(&[message.get("role"), item.get("role"), item.get("type")])
+            .map(py_str).unwrap_or_default();
+        if role == "user" {
+            pending_input += estimate(&visible_text(message.get("content").unwrap_or(&Value::Null)));
+            continue;
+        }
+        let raw_usage = first_truthy(&[message.get("usage"), provider.get("usage"), item.get("usage")])
+            .cloned().unwrap_or(Value::Null);
+        let role_ok = role == "assistant" || role == "model"
+            || (is_wb && (typ == "function_call" || typ == "model-usage"));
+        if !role_ok { continue; }
+        let index_val = json!(cur_index);
+        // python `a or b or index`：末位 index 即使为 0 也作为兜底返回值（or 链末位不判真值）。
+        let message_id = if is_wb {
+            first_truthy(&[provider.get("messageId"), item.get("id")]).unwrap_or(&index_val)
+        } else {
+            first_truthy(&[message.get("id"), message.get("responseId"), item.get("message_id"),
+                           item.get("uuid"), item.get("id")]).unwrap_or(&index_val)
+        };
+        let message_id = py_str(message_id);
+        let key = format!("{}:{}", session, message_id);
+        let content = first_truthy(&[message.get("content"), item.get("content")])
+            .map(|c| c.clone()).unwrap_or(Value::Null);
+        let text_visible = visible_text(&content);
+        let fragment_key = first_truthy(&[item.get("uuid"), item.get("id")])
+            .map(py_str)
+            .unwrap_or_else(|| sha256_hex(&text_visible));
+        let group_model = first_truthy(&[message.get("model"), provider.get("model"),
+                                         provider.get("requestModelId"), Some(&model)])
+            .map(|m| m.clone()).unwrap_or(Value::Null);
+        let group_provider = first_truthy(&[message.get("provider")])
+            .map(|p| p.clone()).unwrap_or(Value::Null);
+        let timestamp = first_truthy(&[item.get("timestamp"), message.get("timestamp")])
+            .map(|t| t.clone()).unwrap_or(Value::Null);
+        let is_new = !groups.contains_key(&key);
+        let group = groups.entry(key.clone()).or_insert_with(|| MsgGroup {
+            input_estimate: pending_input, fragments: HashMap::new(), usage: Value::Null,
+            timestamp, model: group_model, provider: group_provider,
+        });
+        if is_new { order.push(key); }
+        pending_input = 0.0;
+        group.fragments.insert(fragment_key, estimate(&text_visible));
+        // usage 取组内 total 最大帧（>= 后来者胜，与 python 一致）
+        if usage_tokens(&raw_usage, style).3 >= usage_tokens(&group.usage, style).3 {
+            group.usage = raw_usage;
+        }
+    }
+    let mut records = Vec::new();
+    for key in order {
+        let group = &groups[&key];
+        let out: f64 = group.fragments.values().sum();
+        let inp = group.input_estimate;
+        let session_part = key.rsplit_once(':').map(|(s, _)| s).unwrap_or(&key);
+        let model_text = if is_truthy(&group.model) { py_str(&group.model) } else { String::new() };
+        let provider_text = if is_truthy(&group.provider) { py_str(&group.provider) } else { String::new() };
+        records.push(event(&key, session_part, &group.timestamp, &model_text, &group.usage,
+            EventOpts { provider: &provider_text, style, estimated: inp + out,
+                        input_estimate: inp, output_estimate: out, failure: false }));
+    }
+    Ok(records)
+}
+
+/// 事件行参数（与 python event() 全参数对齐；codex 用默认值）。
+struct EventOpts<'a> {
+    provider: &'a str,
+    style: &'a str,
+    estimated: f64,
+    input_estimate: f64,
+    output_estimate: f64,
+    failure: bool,
+}
+
+impl Default for EventOpts<'_> {
+    fn default() -> Self {
+        Self { provider: "", style: "standard", estimated: 0.0, input_estimate: 0.0,
+               output_estimate: 0.0, failure: false }
+    }
+}
+
+/// 事件行（与 python event() 逐字段对齐）。
+/// exact=usage 总量；total<=0 且有估算时用估算顶替（i/o 换成估算的输入/输出）。
+fn event(identity: &str, session: &str, timestamp: &Value, model: &str, usage: &Value, opts: EventOpts) -> Value {
+    let (mut i, mut o, cache, mut total) = usage_tokens(usage, opts.style);
+    let exact = total;
+    if total <= 0.0 && opts.estimated != 0.0 {
+        total = opts.estimated;
+        i = opts.input_estimate;
+        o = opts.output_estimate;
+    }
     let mut row = json!({});
     for m in METRICS { row[m] = json!(0.0); }
     row["id"] = json!(sha256_hex(identity));
@@ -166,30 +430,50 @@ fn event(identity: &str, session: &str, timestamp: &Value, model: &str, usage: &
     row["date"] = json!(local_day(timestamp));
     row["timestamp"] = json!(precise_timestamp(timestamp));
     row["model"] = json!(if model.is_empty() { "未记录模型" } else { model });
-    row["provider"] = json!("未记录供应商");
+    row["provider"] = json!(if opts.provider.is_empty() { "未记录供应商" } else { opts.provider });
     row["tokens"] = json!(total);
-    row["exact_tokens"] = json!(total);
-    row["estimated_tokens"] = json!(0.0);
+    row["exact_tokens"] = json!(exact);
+    row["estimated_tokens"] = json!(if exact != 0.0 { 0.0 } else { total });
     row["input_tokens"] = json!(i);
     row["output_tokens"] = json!(o);
     row["cached_tokens"] = json!(cache);
     row["requests"] = json!(1.0);
-    row["failures"] = json!(0.0);
+    row["failures"] = json!(if opts.failure { 1.0 } else { 0.0 });
     row
+}
+
+/// 与 python json_lines 的 encoding="utf-8-sig", errors="replace" 对齐：
+/// 非法 UTF-8 字节替换为 U+FFFD 继续解析，而不是整文件拒读。
+/// BOM 只在文件头剥一次（utf-8-sig 语义）；行内/行中的 U+FEFF 保留——
+/// python 对行中 BOM 会 json.loads 失败跳过该行，逐行 trim 反而会误收。
+fn read_text_replace(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|_| "读取会话日志失败".to_string())?;
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// python 文本模式 universal newlines 等价切行：\r\n / lone \r / \n 都是行分隔。
+/// Rust str::lines() 只按 \n 切（lone \r 留在行内会让整行 JSON 解析失败），
+/// python open() 默认 newline=None 会把 lone \r 也当行尾——必须对齐。
+fn py_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split('\n').flat_map(|seg| seg.split('\r'))
 }
 
 /// codex rollout.jsonl 解析（与 python codex_file 逐条对齐）。
 pub fn codex_file(path: &Path) -> Result<Vec<Value>, String> {
-    let text = std::fs::read_to_string(path).map_err(|_| "读取会话日志失败".to_string())?;
+    let text = read_text_replace(path)?;
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let mut session = stem;
     let mut previous: Option<(f64, f64, f64, f64)> = None;
     let mut model = String::new();
     let mut records = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let line = line.trim_start_matches('\u{feff}');
+    // python enumerate(json_lines)：index 只数成功解析的 dict 行（与 message_file 同口径）
+    let mut index = 0usize;
+    for line in py_lines(&text) {
         let Ok(item) = serde_json::from_str::<Value>(line) else { continue };
         if !item.is_object() { continue; }
+        let cur_index = index;
+        index += 1;
         let payload = item.get("payload").filter(|p| p.is_object()).cloned().unwrap_or(json!({}));
         if item["type"].as_str() == Some("session_meta") {
             if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
@@ -232,7 +516,7 @@ pub fn codex_file(path: &Path) -> Result<Vec<Value>, String> {
         else { continue; }
         if current_tokens.is_some() { previous = current_tokens; }
         if usage_tokens(&increment, "standard").3 <= 0.0 { continue; }
-        let ts = item.get("timestamp").cloned().unwrap_or(json!(index));
+        let ts = item.get("timestamp").cloned().unwrap_or(json!(cur_index));
         let identity_src = current.as_ref().unwrap_or(&increment);
         // python 的 identity 三段里 timestamp 走 "%s" % item.get(...)：字符串原样、
         // 整数 str(index)——不是 json.dumps。只有第三段（usage dict）走 sort_keys JSON。
@@ -241,7 +525,8 @@ pub fn codex_file(path: &Path) -> Result<Vec<Value>, String> {
             other => other.to_string(),
         };
         let identity = format!("{}:{}:{}", session, ts_text, dumps_sorted(identity_src));
-        records.push(event(&identity, &session, &ts, &model, &increment));
+        records.push(event(&identity, &session, &ts, &model, &increment,
+            EventOpts { style: "codex", ..Default::default() }));
     }
     Ok(records)
 }
@@ -250,17 +535,51 @@ pub fn codex_file(path: &Path) -> Result<Vec<Value>, String> {
 fn codex_paths(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for folder in ["sessions", "archived_sessions"] {
-        let base = root.join(folder);
-        if !base.is_dir() { continue; }
-        let mut stack = vec![base];
-        while let Some(dir) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-            for e in rd.filter_map(|e| e.ok()) {
-                let p = e.path();
-                if p.is_dir() { stack.push(p); }
-                else if p.extension().map(|x| x == "jsonl").unwrap_or(false) { out.push(p); }
+        collect_jsonl(&root.join(folder), &mut out);
+    }
+    out.sort();
+    out
+}
+
+fn collect_jsonl(base: &Path, out: &mut Vec<PathBuf>) {
+    if !base.is_dir() { return; }
+    let mut stack = vec![base.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() { stack.push(p); }
+            else if p.extension().map(|x| x == "jsonl").unwrap_or(false) { out.push(p); }
+        }
+    }
+}
+
+/// messages 系产品（与 python paths_for 的 messages 分支一致）。
+pub fn is_messages_app(app: &str) -> bool {
+    matches!(app, "claude" | "claude-code" | "qoder" | "qoder-cn" | "qoderwork"
+        | "qwenwork" | "qwenworkcn" | "workbuddy" | "workbuddy-intl"
+        | "codebuddy" | "codebuddy-cn" | "minimax")
+}
+
+/// messages 系源文件清单：claude/qoder/workbuddy 等扫 projects/**/*.jsonl；
+/// minimax 只认 v2/sessions/**/messages.jsonl（与 python paths_for 对齐）。
+fn messages_paths(app: &str, root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if app == "minimax" {
+        let base = root.join("v2").join("sessions");
+        if base.is_dir() {
+            let mut stack = vec![base];
+            while let Some(dir) = stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                for e in rd.filter_map(|e| e.ok()) {
+                    let p = e.path();
+                    if p.is_dir() { stack.push(p); }
+                    else if p.file_name().map(|n| n == "messages.jsonl").unwrap_or(false) { out.push(p); }
+                }
             }
         }
+    } else {
+        collect_jsonl(&root.join("projects"), &mut out);
     }
     out.sort();
     out
@@ -290,7 +609,7 @@ struct Cache {
 }
 
 impl Cache {
-    fn open(cache_dir: &Path, app: &str, source_key: &str) -> Result<Self, String> {
+    fn open(cache_dir: &Path, app: &str, source_key: &str, parser_version: &str) -> Result<Self, String> {
         std::fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
         let digest = sha256_hex(&format!("{}|{}", app, source_key));
         let conn = rusqlite::Connection::open(cache_dir.join(format!("{}.db", digest)))
@@ -304,13 +623,12 @@ impl Cache {
              CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);",
         ).map_err(|e| e.to_string())?;
         // 解析器版本变化时整库作废（口径升级不许复用旧事件）
-        const PARSER_VERSION: &str = "rust-codex/1";
         let ver: Option<String> = conn.query_row(
             "SELECT v FROM meta WHERE k='parser_version'", [], |r| r.get(0)).ok();
-        if ver.as_deref() != Some(PARSER_VERSION) {
+        if ver.as_deref() != Some(parser_version) {
             conn.execute_batch("DELETE FROM files;").map_err(|e| e.to_string())?;
             conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('parser_version',?1)",
-                [PARSER_VERSION]).map_err(|e| e.to_string())?;
+                [parser_version]).map_err(|e| e.to_string())?;
         }
         Ok(Self { conn })
     }
@@ -349,6 +667,10 @@ impl Cache {
 /// 聚合（与 python aggregate 对齐）：去重键 session|id 取 (exact,tokens) 最大者。
 fn aggregate(records: Vec<Value>, source: &str, source_key: &str, files: usize, errors: usize, with_records: bool) -> Option<Value> {
     let mut unique: HashMap<String, Value> = HashMap::new();
+    // python dict 按首次插入序遍历：order 记录 identity 首现序，unique 存最终胜者。
+    // 浮点累加顺序必须与 python 完全一致（f64 加法不满足结合律，估算值场景下
+    // HashMap 随机序会产生末位漂移——golden 是逐位相等断言，不容忍顺序差异）。
+    let mut order: Vec<String> = Vec::new();
     for row in records {
         let identity = format!("{}|{}", row["session"].as_str().unwrap_or(""), row["id"].as_str().unwrap_or(""));
         let better = match unique.get(&identity) {
@@ -358,7 +680,10 @@ fn aggregate(records: Vec<Value>, source: &str, source_key: &str, files: usize, 
                     >= (number(&old["exact_tokens"]), number(&old["tokens"]))
             }
         };
-        if better { unique.insert(identity, row); }
+        if better {
+            if !unique.contains_key(&identity) { order.push(identity.clone()); }
+            unique.insert(identity, row);
+        }
     }
     if unique.is_empty() { return None; }
 
@@ -397,19 +722,9 @@ fn aggregate(records: Vec<Value>, source: &str, source_key: &str, files: usize, 
     let mut summary = Bucket::default();
     let mut days: std::collections::BTreeMap<String, Bucket> = std::collections::BTreeMap::new();
     let mut undated = 0.0;
-    // 与 python dict 插入序对齐：unique 按记录首次出现序遍历
-    let mut seen_order: Vec<String> = Vec::new();
-    let mut by_identity: HashMap<String, Value> = HashMap::new();
-    // 重新按原始顺序收集（unique 的最终值）
-    // 注：python 的 unique.values() 按首次插入序；这里用 seen_order 复现
-    // （records 已被上面消费，改为在去重时记录顺序——重做一次轻量遍历）
-    // 为保序，这里直接从 unique 构造时记录：见下方 order 收集。
-    let _ = &mut seen_order;
-    let _ = &mut by_identity;
-    // 简化：BTreeMap 按 identity 排序会改变 models 内浮点累加顺序，但 METRICS 累加
-    // 对顺序不敏感（同为非负数求和，f64 结合误差在 golden delta 内）。sessions/models
-    // 集合语义与顺序无关（models 输出显式排序）。
-    for row in unique.values() {
+    // 按首现序遍历（与 python unique.values() 的 dict 插入序逐位对齐）
+    for identity in &order {
+        let row = &unique[identity];
         if number(&row["tokens"]) <= 0.0 && number(&row["requests"]) == 0.0 { continue; }
         summary.add(row);
         let date = row["date"].as_str().unwrap_or("");
@@ -425,9 +740,16 @@ fn aggregate(records: Vec<Value>, source: &str, source_key: &str, files: usize, 
         v["credits"] = json!(bucket.metrics.get("tokens").copied().unwrap_or(0.0));
         v
     }).collect();
-    let peak = days.iter().max_by(|a, b| {
-        a.1.metrics.get("tokens").copied().unwrap_or(0.0)
-            .partial_cmp(&b.1.metrics.get("tokens").copied().unwrap_or(0.0)).unwrap()
+    // python max() 并列取首个（days 已按日期升序）→ 并列峰值取最早一天。
+    // Rust max_by 并列取末个，这里显式改取首个对齐。
+    let peak = days.iter().fold(None, |best: Option<(&String, &Bucket)>, (day, bucket)| {
+        let tokens = bucket.metrics.get("tokens").copied().unwrap_or(0.0);
+        match best {
+            None => Some((day, bucket)),
+            Some((_, b)) => {
+                if tokens > b.metrics.get("tokens").copied().unwrap_or(0.0) { Some((day, bucket)) } else { best }
+            }
+        }
     });
     let summary_out = summary.finish();
     let has_estimate = summary.metrics.get("estimated_tokens").copied().unwrap_or(0.0) > 0.0;
@@ -454,7 +776,8 @@ fn aggregate(records: Vec<Value>, source: &str, source_key: &str, files: usize, 
     result["sessions"] = summary_out["sessions"].clone();
     result["models"] = summary_out["models"].clone();
     if with_records {
-        result["_records"] = json!(unique.values().map(|r| {
+        result["_records"] = json!(order.iter().map(|identity| {
+            let r = &unique[identity];
             let mut v = json!({});
             if let Some(o) = r.as_object() {
                 for (k, val) in o {
@@ -469,24 +792,58 @@ fn aggregate(records: Vec<Value>, source: &str, source_key: &str, files: usize, 
     Some(result)
 }
 
-/// codex/chatgpt 采集入口（与 python collect 同契约）。cache_dir=None 时不缓存（测试用）。
-pub fn collect_codex(app: &str, root: &Path, cache_dir: Option<&Path>, with_records: bool) -> Result<Option<Value>, String> {
+/// python SOURCES 表（未收录的 app 用 "本机 {app} 会话日志"，如 chatgpt/qoder 系）。
+fn source_label(app: &str) -> String {
+    let label = match app {
+        "codex" => "本机 Codex 会话日志",
+        "claude" => "本机 Claude Code 会话日志",
+        "workbuddy" => "本机 WorkBuddy 会话日志",
+        "workbuddy-intl" => "本机 WorkBuddy 国际版会话日志",
+        "zcode" => "本机 ZCode model_usage 请求库",
+        "opencode" => "本机 OpenCode 请求库",
+        "minimax" => "本机 MiniMax 会话日志",
+        "marvis" => "本机 Marvis 日用量库",
+        "astudio" => "本机 AStudio 逐轮计费报告",
+        "dsh" => "本机 DSH 会话日志逐条 usage",
+        _ => "",
+    };
+    if label.is_empty() { format!("本机 {} 会话日志", app) } else { label.to_string() }
+}
+
+/// 与 python Path.resolve() + os.path.normcase 对齐的源键：
+/// Windows 上 Rust canonicalize 带 \\?\ 前缀而 python 不带，须剥掉；再小写化。
+fn strip_verbatim(s: &str) -> String {
+    s.strip_prefix(r"\\?\UNC\").map(|r| format!(r"\{}", r))
+        .or_else(|| s.strip_prefix(r"\\?\").map(|r| r.to_string()))
+        .unwrap_or_else(|| s.to_string())
+}
+
+fn normalized_source_key(root: &Path) -> String {
+    strip_verbatim(&root.to_string_lossy()).to_lowercase()
+}
+
+/// 共享采集循环：指纹命中缓存直接复用，未命中调解析器并回写；prune 清已删源。
+/// codex 与 messages 系共用同一 SQLite 缓存机制（每源一库，parser_version 隔离）。
+fn collect_files(app: &str, root: &Path, cache_dir: Option<&Path>, with_records: bool,
+                 paths: Vec<PathBuf>, parser_version: &str,
+                 parse: impl Fn(&Path) -> Result<Vec<Value>, String>) -> Result<Option<Value>, String> {
     if !root.is_dir() { return Ok(None); }
     let root = root.canonicalize().map_err(|_| "无法解析数据目录".to_string())?;
-    let source_key = root.to_string_lossy().to_lowercase();
-    let cache = cache_dir.and_then(|d| Cache::open(d, app, &source_key).ok());
+    let source_key = normalized_source_key(&root);
+    let cache = cache_dir.and_then(|d| Cache::open(d, app, &source_key, parser_version).ok());
     let mut records = Vec::new();
     let mut errors = 0usize;
     let mut files = 0usize;
     let mut keep: Vec<String> = Vec::new();
-    for path in codex_paths(&root) {
+    for path in paths {
         if !path.is_file() { continue; }
-        let rel = path.strip_prefix(&root).map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+        // rel 键与 python str(path.relative_to(root)) 对齐：剥 \\?\ 前缀（canonicalize 产物）
+        let rel = path.strip_prefix(&root).map(|p| strip_verbatim(&p.to_string_lossy()))
+            .unwrap_or_else(|_| strip_verbatim(&path.to_string_lossy()));
         let stamp = fingerprint(&path);
         let rows = match cache.as_ref().and_then(|c| c.cached(&rel, stamp)) {
             Some(rows) => rows,
-            None => match codex_file(&path) {
+            None => match parse(&path) {
                 Ok(rows) => {
                     if let Some(c) = &cache { let _ = c.store(&rel, stamp, &rows); }
                     rows
@@ -499,12 +856,27 @@ pub fn collect_codex(app: &str, root: &Path, cache_dir: Option<&Path>, with_reco
         files += 1;
     }
     if let Some(c) = &cache { let _ = c.prune(&keep); }
-    let source = "本机 Codex 会话日志";
-    let result = aggregate(records, source, &source_key, files, errors, with_records);
+    let result = aggregate(records, &source_label(app), &source_key, files, errors, with_records);
     if result.is_none() && errors > 0 {
         return Ok(Some(json!({"error": "本地用量文件读取失败，请检查文件权限与数据库状态。"})));
     }
     Ok(result)
+}
+
+/// codex/chatgpt 采集入口（与 python collect 同契约）。cache_dir=None 时不缓存（测试用）。
+pub fn collect_codex(app: &str, root: &Path, cache_dir: Option<&Path>, with_records: bool) -> Result<Option<Value>, String> {
+    if !root.is_dir() { return Ok(None); }
+    let paths = codex_paths(root);
+    collect_files(app, root, cache_dir, with_records, paths, "rust-codex/1", codex_file)
+}
+
+/// messages 系采集入口（claude/qoder/workbuddy/minimax 等，与 python collect 同契约）。
+pub fn collect_messages(app: &str, root: &Path, cache_dir: Option<&Path>, with_records: bool) -> Result<Option<Value>, String> {
+    if !root.is_dir() { return Ok(None); }
+    let paths = messages_paths(app, root);
+    let app_owned = app.to_string();
+    collect_files(app, root, cache_dir, with_records, paths, "rust-messages/1",
+        move |p| message_file(p, &app_owned))
 }
 
 #[cfg(test)]
@@ -608,38 +980,201 @@ mod tests {
         };
         let py_path = std::env::var("T17_GOLDEN_PY_RESULT").expect("应有 python 结果路径");
         let py: Value = serde_json::from_str(&std::fs::read_to_string(&py_path).unwrap()).unwrap();
-        // 与 python 侧同 with_records 口径（真实数据抽样用 False 省内存）
         let with_records = py.get("_records").is_some();
         let rs = collect_codex("codex", Path::new(&fixture_dir), None, with_records).unwrap().expect("Rust 应聚出结果");
-        // 标量字段逐一比对（数值按 f64 比——python sum([]) 返回 int 0，Rust 恒 f64，
-        // 序列化形态差异不属口径漂移）
+        assert_golden_eq(&rs, &py, with_records);
+    }
+
+    /// T17 第二阶段 golden：messages 系（app 由 T17M_GOLDEN_APP 指定）与 python 逐字段比对。
+    #[test]
+    fn golden_messages_matches_python() {
+        let Ok(fixture_dir) = std::env::var("T17M_GOLDEN_FIXTURE") else {
+            eprintln!("跳过 golden：未设 T17M_GOLDEN_FIXTURE");
+            return;
+        };
+        let app = std::env::var("T17M_GOLDEN_APP").expect("应有 app");
+        let py_path = std::env::var("T17M_GOLDEN_PY_RESULT").expect("应有 python 结果路径");
+        let py: Value = serde_json::from_str(&std::fs::read_to_string(&py_path).unwrap()).unwrap();
+        let with_records = py.get("_records").is_some();
+        let rs = collect_messages(&app, Path::new(&fixture_dir), None, with_records).unwrap().expect("Rust 应聚出结果");
+        assert_golden_eq(&rs, &py, with_records);
+    }
+
+    /// golden 比对公共逻辑：标量按 f64（python int 0 vs Rust f64 0.0 属形态差异非口径漂移）、
+    /// days 逐日、models 汇总、_records 按 id 对齐后逐字段（含 date/timestamp/model/provider）。
+    fn assert_golden_eq(rs: &Value, py: &Value, with_records: bool) {
         for key in ["total", "input_tokens", "output_tokens", "cached_tokens", "exact_tokens",
                     "estimated_tokens", "requests", "sessions", "files", "peak",
-                    "undated_tokens"] {
+                    "undated_tokens", "failures"] {
             assert_eq!(rs[key].as_f64(), py[key].as_f64(), "字段 {key} 不一致：rust={} python={}", rs[key], py[key]);
         }
-        for key in ["peak_date", "unit", "source", "attribution"] {
-            assert_eq!(rs[key], py[key], "字段 {key} 不一致");
+        for key in ["peak_date", "unit", "source", "attribution", "source_key", "coverage", "estimate_method"] {
+            assert_eq!(rs[key], py[key], "字段 {key} 不一致：rust={} python={}", rs[key], py[key]);
         }
-        // days 逐日比对（date/credits/tokens/sessions）
         let rd = rs["days"].as_array().unwrap();
         let pd = py["days"].as_array().unwrap();
         assert_eq!(rd.len(), pd.len(), "天数不一致");
         for (r, p) in rd.iter().zip(pd.iter()) {
-            for key in ["date", "credits", "tokens", "sessions", "input_tokens", "output_tokens"] {
-                assert_eq!(r[key], p[key], "day {key} 不一致");
+            for key in ["date", "credits", "tokens", "sessions", "input_tokens", "output_tokens",
+                        "estimated_tokens", "exact_tokens", "cached_tokens", "requests"] {
+                assert_eq!(r[key].as_f64(), p[key].as_f64(), "day {} {key} 不一致：rust={} python={}", r["date"], r[key], p[key]);
+            }
+            assert_eq!(r["date"], p["date"], "day 日期序不一致");
+        }
+        assert_eq!(rs["models"], py["models"], "models 汇总不一致");
+        if with_records {
+            let index = |v: &Value| -> HashMap<String, Value> {
+                v["_records"].as_array().unwrap().iter()
+                    .map(|r| (r["id"].as_str().unwrap().to_string(), r.clone())).collect()
+            };
+            let rmap = index(rs);
+            let pmap = index(py);
+            let mut rids: Vec<&String> = rmap.keys().collect();
+            let mut pids: Vec<&String> = pmap.keys().collect();
+            rids.sort(); pids.sort();
+            assert_eq!(rids, pids, "事件 id 集合不一致（identity/分组口径漂移即红）");
+            for id in rids {
+                let r = &rmap[id];
+                let p = &pmap[id];
+                for key in ["session", "date", "model", "provider"] {
+                    assert_eq!(r[key], p[key], "record {id} 字段 {key} 不一致");
+                }
+                for key in ["timestamp", "tokens", "exact_tokens", "estimated_tokens", "input_tokens",
+                            "output_tokens", "cached_tokens", "requests", "failures"] {
+                    assert_eq!(r[key].as_f64(), p[key].as_f64(), "record {id} 字段 {key} 不一致：rust={} python={}", r[key], p[key]);
+                }
             }
         }
-        // _records 的 id 集合一致（identity 哈希口径对齐的最强证据；with_records=False 时跳过）
-        if with_records {
-            let mut rids: Vec<String> = rs["_records"].as_array().unwrap().iter()
-                .map(|r| r["id"].as_str().unwrap().to_string()).collect();
-            let mut pids: Vec<String> = py["_records"].as_array().unwrap().iter()
-                .map(|r| r["id"].as_str().unwrap().to_string()).collect();
-            rids.sort(); pids.sort();
-            assert_eq!(rids, pids, "事件 id 集合不一致（identity/哈希口径漂移即红）");
-        }
-        // models 汇总一致
-        assert_eq!(rs["models"], py["models"], "models 汇总不一致");
+    }
+
+    /// messages 估算口径单元锚点：CJK 1 token/字、其余 4 字符/token、向上取整。
+    #[test]
+    fn estimate_cjk_and_ascii() {
+        assert_eq!(estimate(""), 0.0);
+        assert_eq!(estimate("你好"), 2.0);
+        assert_eq!(estimate("abcd"), 1.0);
+        assert_eq!(estimate("abcde"), 2.0); // ceil(5/4)
+        assert_eq!(estimate("你好abcd"), 3.0); // 2 + 1
+        assert_eq!(estimate("𠀀"), 1.0); // 扩展 B（>=0x20000）算 CJK
+        assert_eq!(estimate("한글"), 2.0); // 谚文
+    }
+
+    /// visible_text 口径：只认 text/input_text/output_text/tool_result.content；
+    /// image/base64/reasoning 签名/序列化工具载荷一律不计。
+    #[test]
+    fn visible_text_excludes_hidden_payloads() {
+        let v = json!([
+            {"type": "text", "text": "你好"},
+            {"type": "image", "source": {"data": "base64xxxx"}},
+            {"type": "tool_use", "input": {"secret": "x"}},
+            {"type": "tool_result", "content": [{"type": "text", "text": "ok"}]},
+            {"type": "thinking", "thinking": "hidden"}
+        ]);
+        assert_eq!(visible_text(&v), "你好\nok");
+        assert_eq!(visible_text(&json!("plain")), "plain");
+        assert_eq!(visible_text(&json!({"type": "text"})), "");
+    }
+
+    /// 行分隔口径护栏：python 文本模式 universal newlines 把 lone \r 也当行尾，
+    /// Rust str::lines() 不切——py_lines 必须对齐，否则整行 JSON 解析失败丢记录。
+    #[test]
+    fn py_lines_universal_newlines() {
+        let a = r#"{"id":"a"}"#;
+        let b = r#"{"id":"b"}"#;
+        let c = r#"{"id":"c"}"#;
+        // lone \r 分隔
+        let text = format!("{a}\r{b}\n{c}");
+        let lines: Vec<&str> = py_lines(&text).collect();
+        assert_eq!(lines, vec![a, b, c], "lone \\r 必须切行（python universal newlines）");
+        // \r\n 不产生空行
+        let text2 = format!("{a}\r\n{b}\r\n");
+        let lines2: Vec<&str> = py_lines(&text2).filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines2, vec![a, b]);
+    }
+
+    /// lone-CR 端到端：两条 assistant 用 \r 分隔，必须聚出 2 条记录（修复前为 0）。
+    #[test]
+    fn messages_lone_cr_splits_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("projects").join("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = r#"{"type":"assistant","sessionId":"s","timestamp":"2026-05-27T06:00:00Z","message":{"role":"assistant","id":"a","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let b = r#"{"type":"assistant","sessionId":"s","timestamp":"2026-05-27T06:01:00Z","message":{"role":"assistant","id":"b","usage":{"input_tokens":20,"output_tokens":7}}}"#;
+        std::fs::write(dir.join("conv.jsonl"), format!("{a}\r{b}\n")).unwrap();
+        let v = collect_messages("claude", tmp.path(), None, true).unwrap().expect("lone-CR 应聚出结果");
+        assert_eq!(v["_records"].as_array().unwrap().len(), 2, "lone-CR 两条记录都应在");
+        assert_eq!(v["total"].as_f64(), Some(42.0));
+    }
+
+    /// BOM 口径护栏：utf-8-sig 只剥文件头 BOM；行中 U+FEFF 保留（python 会解析失败跳过）。
+    #[test]
+    fn bom_only_stripped_at_file_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("projects").join("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = r#"{"type":"assistant","sessionId":"s","timestamp":"2026-05-27T06:00:00Z","message":{"role":"assistant","id":"a","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        // 文件头 BOM + 合法行 → 应解析
+        let mut bytes = b"\xef\xbb\xbf".to_vec();
+        bytes.extend_from_slice(good.as_bytes());
+        bytes.push(b'\n');
+        // 第二行行中夹 BOM → python json.loads 失败跳过，Rust 也应跳过
+        bytes.extend_from_slice("{\"type\":\"assistant\"".as_bytes());
+        bytes.extend_from_slice(b"\xef\xbb\xbf");
+        bytes.extend_from_slice(",\"sessionId\":\"s\",\"message\":{\"role\":\"assistant\",\"id\":\"b\",\"usage\":{\"input_tokens\":99,\"output_tokens\":99}}}\n".as_bytes());
+        std::fs::write(dir.join("conv.jsonl"), bytes).unwrap();
+        let v = collect_messages("claude", tmp.path(), None, true).unwrap().expect("头 BOM 行应聚出结果");
+        assert_eq!(v["_records"].as_array().unwrap().len(), 1, "行中 BOM 的坏行应被跳过（只计头 BOM 合法行）");
+        assert_eq!(v["total"].as_f64(), Some(15.0));
+    }
+
+    /// index 兜底口径护栏：python enumerate(json_lines) 只数解析成功的 dict 行。
+    /// 坏行在前 + 无 id 消息在后时，兜底 index 必须是「已解析行序」而非原始行号。
+    #[test]
+    fn index_fallback_counts_parsed_rows_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("projects").join("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 行0 坏行；行1 runtime-config（解析成功 index0）；行2 user（index1）；
+        // 行3 无 id assistant（index2 → 兜底分组键 "s:2"）
+        let lines = [
+            "garbage-not-json",
+            r#"{"type":"runtime-config","sessionId":"s","model":"m"}"#,
+            r#"{"type":"user","sessionId":"s","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","sessionId":"s","timestamp":"2026-05-27T06:00:00Z","message":{"role":"assistant","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        ];
+        std::fs::write(dir.join("conv.jsonl"), lines.join("\n")).unwrap();
+        let v = collect_messages("claude", tmp.path(), None, true).unwrap().expect("应聚出结果");
+        let recs = v["_records"].as_array().unwrap();
+        assert_eq!(recs.len(), 1);
+        // 分组键 "s:2" 只体现在 identity 哈希（session 字段是 rsplit 后的 "s"）。
+        // 兜底 index 若误用原始行号会算成 "s:3"，id 即不同。
+        assert_eq!(recs[0]["id"].as_str(), Some(sha256_hex("s:2").as_str()),
+            "无 id 消息的兜底分组键应为 s:2（已解析行序），不是原始行号 s:3");
+        assert_eq!(recs[0]["session"].as_str(), Some("s"));
+    }
+
+    /// aggregate 去重保序护栏：_records 必须按 identity 首现序输出（python dict 插入序），
+    /// 且同 identity 取 (exact,tokens) 最大者。回退 HashMap 随机序会漂移浮点累加顺序。
+    #[test]
+    fn aggregate_preserves_first_seen_order() {
+        let mk = |session: &str, id: &str, tokens: f64| {
+            let mut row = json!({"session": session, "id": id, "date": "2026-05-27",
+                "model": "m", "provider": "p", "requests": 1.0});
+            for m in METRICS { row[m] = json!(0.0); }
+            row["tokens"] = json!(tokens);
+            row["exact_tokens"] = json!(tokens);
+            row
+        };
+        // 首现序 c,a,b；a 重复且后帧更大（应取 50 但位置仍在 a 首现处）
+        let records = vec![
+            mk("s", "c", 3.0), mk("s", "a", 10.0), mk("s", "b", 2.0), mk("s", "a", 50.0),
+        ];
+        let v = aggregate(records, "src", "key", 1, 0, true).expect("应聚出结果");
+        let ids: Vec<&str> = v["_records"].as_array().unwrap().iter()
+            .map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["c", "a", "b"], "_records 必须按首现序（python dict 插入序）");
+        let a = v["_records"].as_array().unwrap().iter().find(|r| r["id"] == "a").unwrap();
+        assert_eq!(a["tokens"].as_f64(), Some(50.0), "同 identity 应取最大帧");
+        assert_eq!(v["total"].as_f64(), Some(55.0));
     }
 }
