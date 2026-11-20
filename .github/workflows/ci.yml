@@ -94,6 +94,16 @@ jobs:
         with:
           python-version: "3.14"
 
+      # 产品口径=本机时区（Rust chrono::Local 与 python astimezone() 同口径），
+      # 测试钉的是国内使用环境（北京）的期望值。runner 默认 UTC 会让
+      # 「16:20Z 归次日」「19:28 刷新」这类断言红。把系统时区设成 China Standard Time，
+      # 与产品主要使用环境一致；不弱化 golden 钉住，也不改生产代码口径。
+      # chrono::Local 读系统时区（GetTimeZoneInformation），不读 TZ 环境变量，必须 Set-TimeZone。
+      - name: Set runner timezone to China Standard Time (product locale)
+        run: |
+          Set-TimeZone -Id "China Standard Time"
+          Get-TimeZone | Select-Object Id, DisplayName | Format-List
+
       - name: Rust full test suite (no remap flags, golden-compatible fingerprints)
         working-directory: src-tauri
         run: |

@@ -2489,18 +2489,49 @@ mod tests {
     /// 2026-10-11 升级把目录从 TRAE SOLO CN 改名 Trae CN：新版优先，老安装回落旧目录。
     #[test]
     fn trae_profile_points_at_userdata_not_runtime_home() {
-        let d = profile_dir("traework-cn").expect("TRAE CN 该有换号目标");
-        let s = d.to_string_lossy().to_lowercase();
-        assert!(
-            s.ends_with("trae cn") || s.ends_with("trae solo cn"),
-            "TRAE CN 的换号目标该是 %APPDATA% 下的登录目录（Trae CN 优先、TRAE SOLO CN 回落），实际：{s}"
-        );
-        assert!(d.is_absolute(), "该是绝对路径：{d:?}");
-        assert_ne!(d, home().join(".trae-cn"));
-        // 运行时数据目录 ~/.trae-cn 不该被当成换号目标
-        assert!(!d.components().any(|c| c.as_os_str() == ".trae-cn"));
-        // 有登录数据（Local State + state.vscdb），has_login_data 该认得出
-        assert!(has_login_data(&d), "userData 目录该有登录数据标志：{d:?}");
+        // 模板契约：候选必须是 %APPDATA% 下的登录目录（Trae CN 优先、TRAE SOLO CN 回落），
+        // 不是 ~/.trae-cn 运行时目录。只验「模板展开 + 候选顺序」，不要求本机装过 Trae CN
+        // （CI 干净机没有登录数据；与 qoder 模板测试同一原则：期望值来自注入 fixture，
+        // 不能来自真实机器状态）。
+        let q = app_def("traework-cn").expect("traework-cn 该在 curated 里");
+        let spec = q.profile.as_deref().expect("TRAE CN 该有 profile 候选");
+        assert_eq!(spec, "{APPDATA}/Trae CN|{APPDATA}/TRAE SOLO CN");
+        let ad = std::env::var("APPDATA").unwrap_or_default();
+        assert!(!ad.is_empty(), "本机该有 APPDATA");
+        let expanded: Vec<PathBuf> = spec.split('|').map(one_profile).collect();
+        assert_eq!(expanded[0], PathBuf::from(&ad).join("Trae CN"));
+        assert_eq!(expanded[1], PathBuf::from(&ad).join("TRAE SOLO CN"));
+        for d in &expanded {
+            assert!(d.is_absolute(), "该是绝对路径：{d:?}");
+            assert_ne!(d, &home().join(".trae-cn"));
+            assert!(!d.components().any(|c| c.as_os_str() == ".trae-cn"));
+        }
+
+        // 「挑哪个候选」由 resolve_profile_in 决定，用注入目录测，不读本机 %APPDATA%。
+        let tmp = std::env::temp_dir().join("cockpit-trae-appdata-template-test");
+        let _ = fs::remove_dir_all(&tmp);
+        let instances = tmp.join("instances");
+        let new_shell = tmp.join("Trae CN");
+        let legacy = tmp.join("TRAE SOLO CN");
+        fs::create_dir_all(&new_shell).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        let injected = format!("{}|{}", new_shell.to_string_lossy(), legacy.to_string_lossy());
+        // 两边都空：按候选顺序落到第一个（Trae CN 优先）
+        assert_eq!(resolve_profile_in(&injected, &instances).as_deref(), Some(new_shell.as_path()));
+        // 只有旧壳留着登录痕迹（Local State + state.vscdb）→ 回落旧壳，
+        // has_login_data 必须认得这套 userData 标志
+        fs::create_dir_all(legacy.join("User").join("globalStorage")).unwrap();
+        fs::write(legacy.join("Local State"), "{}").unwrap();
+        fs::write(legacy.join("User").join("globalStorage").join("state.vscdb"), "").unwrap();
+        assert!(has_login_data(&legacy), "userData 目录该有登录数据标志");
+        assert!(!has_login_data(&new_shell));
+        assert_eq!(resolve_profile_in(&injected, &instances).as_deref(), Some(legacy.as_path()));
+        // 新壳也有登录数据 → 新版优先
+        fs::create_dir_all(new_shell.join("User").join("globalStorage")).unwrap();
+        fs::write(new_shell.join("Local State"), "{}").unwrap();
+        fs::write(new_shell.join("User").join("globalStorage").join("state.vscdb"), "").unwrap();
+        assert_eq!(resolve_profile_in(&injected, &instances).as_deref(), Some(new_shell.as_path()));
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     /// 换号后目标目录变成 junction，解析必须继续认它——否则会漂回另一个"有登录数据"的
