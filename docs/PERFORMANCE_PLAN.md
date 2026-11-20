@@ -252,6 +252,7 @@
 | **T18 第三批**（2026-11-20，用户「继续推进 T18 第三批」） | `chatgpt-history.py` 的**项目修复路径**迁 Rust：新增 `chatgpt_history_repair.rs`（project_repair_plan/repair_projects，ordinary 路径校验/key normcase/project_visibility_state/database_paths/primary_state_db/project_rows/计划识别/apply 备份+事务删除+失败回滚）；`chatgpt_history.rs run_script` 接线 repair_projects mode Rust 优先失败回退 python。**范围红线**：copy_history/shared-history/sync 涉及目录 junction/整库复制/WAL 退役/凭据隔离，属数据丢失级，**仍走 python 不触碰**。rusqlite 加 backup feature | **跨语言 golden**：合成 source/target（state_5.sqlite+state JSON+marker）python plan/apply vs Rust 逐字段一致 + apply 后 state/db 内容比对。12 条单测绿（dry_run/apply 备份/expected_plan 校验/所有权/重叠/has_thread 守卫/key/visibility）；**3 条变异红**（时间窗收紧/所有权反转/has_thread 禁用）还原零残留。全量 **499 项 = 466 过 / 0 失败 / 33 忽略**（487→499 +12）。privacy 0 findings。**已提交 eb285ae** |
 | **T19 部分迁①**（2026-11-20，用户「暂不部署，先完成项目任务推进」） | `agentfind.py cmd_stop` 去 PowerShell：`stop_legacy` 优先 Rust 原生（sysinfo 枚举命令行匹配 python+agentfind.py 排除自身 + `procs::kill_pids` 整树结束），免起 python --stop 子进程再调 PowerShell+taskkill；失败回退原 python --stop。`is_agentfind_service` 谓词抽独立函数单测钉住口径 | 与 python cmd_stop 同口径（按命令行匹配全部服务进程，不只端口上那一个）。新增 1 单测；**2 条变异红**（去 agentfind.py 过滤/去自身排除）还原零残留。全量 **500 项 = 467 过 / 0 失败 / 33 忽略**（499→500 +1）。privacy 0 findings。**已提交 6f3d232** |
 | **T19 部分迁②**（2026-11-20，用户「暂不部署，先完成项目任务推进」） | `agentfind.py` 728 行内嵌前端 PAGE 挪到独立静态资源 `agentfind-page.html`（纯搬运字节不变，46819 字节）；python `_load_page()` 同目录读取，缺失给最小错误页不静默白屏；`agentfind.rs` include_str! 编进 PAGE_HTML，script_file_at 同目录释放+字节复用+损坏修复。**脚本指纹不再含 PAGE**——前端改动不再触发服务重启 | python 验证 PAGE==html 字节一致 + 缺失回退错误页；新增 1 单测 + 扩展释放修复测试。全量 **501 项 = 468 过 / 0 失败 / 33 忽略**（500→501 +1）。privacy 0 findings。agentfind.py 3217→2502 行（−715）。**已提交 f3ead67** |
+| **CI 编译工作流**（2026-11-20/21，用户「创建 CI 编译工作流」） | 此前两仓均无任何 workflow、Actions 运行数 0——「推送触发 CI 编译」从未发生。新增 `.github/workflows/ci.yml`（windows-latest + MSVC，Rust 钉 1.100.0 与本地同版本）+ 两个 helper：`tools/ci_prepare_runtime.py`（从入库 vendor zip 解出 vendored python，cryptography 随 agenthub-libs.zip，零 pip，自检 fail closed）、`tools/ci_privacy_gate.py`（隐私门只喂 git 跟踪清单，排除 registry 缓存/编译产物的第三方示例邮箱误报，规则引擎复用 privacy_check）。门禁链：Rust 全量单测（不带 remap 标志，与 golden 子进程同指纹，junction 复用 target）→ release 编译（private_build 路径脱敏 + custom-protocol）→ 源码/二进制隐私门 → Node 粘贴解析 → 离线 Python 回归 11 套 → 跨语言 golden 6 套 → 上传 release 产物。有意排除：浏览器套件（需 Chromium）、真机抽样（opt-in）、部署（永不） | **run #3 全绿**（https://github.com/Ayinyue/agent-cockpit/actions/runs/44774717667）：Rust **465 过 / 0 失败 / 33 忽略** + 第二二进制 3/3；release 8m02s；隐私门源码/二进制双 0 findings；离线回归 11/11；golden 6/6（agentcrypt/DPAPI/usage 4 fixture/zcode 4 模式/trae/history-repair plan+apply）；产物 agent-cockpit-windows-x64（24.4MB，retention 14 天）。**前两轮红的根因均非产品缺陷**：run#1 9 红 = fixture 8.3 短名（runner TEMP 含 RUNNER~1，marker 原始拼写 vs canonicalize 长名 key 不等）×6 + trae 测试依赖本机登录态 ×1 + runner UTC vs 北京期望值 ×2；run#2 1 红 = python golden 驱动 build_pair 漏修同一短名问题。修法：fixture 先 resolve/canonicalize 再写 marker（与生产 copy_history 同口径）、trae 改注入 fixture（与 qoder 模板测试同原则）、CI Set-TimeZone China Standard Time（产品口径=本机时区，不弱化 golden）。短名修复经 GetShortPathNameW 造短名环境双重验证（python plan + Rust golden 均绿）。**已提交 de3fb5e / ca0099d / 9ac0d54** |
 
 **顺带修掉的 4 套既有测试缺陷**（都不是本轮引入，在 Chrome 上同样会红）：
 - `add-app-picker` / `external-checkin` / `checkin-pending-day` / `workbuddy-accounts`：未屏蔽新手引导，
@@ -279,7 +280,14 @@
   usage-local.py 全部产品 Rust 解析完成，python 仅作回退保底。**T18 第一批 trae-gateway-clean / 第二批 zcode-auth / 第三批 chatgpt-history 项目修复** 已于 11-20 完成并提交。
   **T19 部分迁①cmd_stop 去 PowerShell / ②728 行 PAGE 挪静态资源** 已于 11-20 完成并提交（长驻服务主体按评估「留」不迁）。
   **T18 剩余 copy_history/shared-history/sync 三条路径暂缓**：涉及目录 junction/整库复制/SQLite WAL 退役/凭据隔离，属数据丢失级，
-  须真实登录态 golden 样本 + 单独授权，不在本轮擅自迁移。）
+  须真实登录态 golden 样本 + 单独授权，不在本轮擅自迁移。
+  **CI 编译工作流**已于 11-20/21 建成并全绿（run #3，见上表）；浏览器套件与真机抽样有意不在 CI 内。）
+
+- **上游分叉待整合（2026-11-21 核实）**：origin/main 领先 8 提交（v2.6.0 积分台账/密钥体检/站点级取模型 + agentfind 脚本合一），
+  与本会话 T17/T18/T19 改动**直接冲突**：上游 `zcode-auth.py` 新增 enc:v2 凭据信封（OS keyring/env 双源 + 24-hex 指纹校验，+198 行）
+  且 `zcode.rs` 回退了 T18 Rust 接线；上游 `agentfind.py` 把 PAGE 重新内嵌（+790 行，与 T19② 静态资源化相反）并修了启动自证自杀。
+  合并须以**上游功能为准、迁移层重新适配**（enc:v2 需先迁 Rust 或保留 python 回退；PAGE 静态资源化需在上游新版前端上重做），
+  属新批次工作，不在 CI 批次擅自合并。本会话 main 已推 fork（9ac0d54），未动 origin。
 
 ---
 
