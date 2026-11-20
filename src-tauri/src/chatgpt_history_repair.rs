@@ -628,6 +628,13 @@ mod tests {
         let target = tmp.path().join("target");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&target).unwrap();
+        // CI runner 的 TEMP 可能含 8.3 短名段（如 RUNNER~1）：plan/apply 里 canonicalize
+        // 会展开成长名，marker 若写原始拼写则 key 不等 → ownership 误判。
+        // 与生产口径对齐（copy_history 写 marker 前也先 resolve），fixture 同样先展开。
+        let source = source.canonicalize().unwrap();
+        let target = target.canonicalize().unwrap();
+        let source = crate::registry::strip_verbatim(&source);
+        let target = crate::registry::strip_verbatim(&target);
         // source state：已完成迁移，local-projects 有 proj-a（rootPaths=C:/Work/A），
         // 旧工作区列表含 C:/Work/A 与 C:/Work/Stale（后者不在 local-projects → stale）
         let source_state = json!({
