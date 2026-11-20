@@ -248,6 +248,7 @@
 | **T17 第三阶段**（2026-11-20，用户「推进 T17 第三阶段」） | DB 系/dsh/gemini 解析迁 Rust：`zcode_db`（model_usage 请求库，provider/computed total 兜底+failure+计时）/`opencode_db`（新表 session_message 覆盖旧表同 id，opencode style reasoning 单列）/`marvis_db`（llm_token_usage 逐行）/`astudio_db`（拆 report_json.model_usages 子 turn）/`dsh_file`（zstd 解压+assistant/message 过滤）/`gemini_file`（整包 JSON messages+user 累计估算）；`collect_other` 统一入口+`is_other_app`；`usage.rs` 接线→Rust 失败回退 python。EventOpts 加 duration/ttft，event() 补计时字段。Cargo.toml 加 zstd 0.13 | **真实 zcode 1.23GB/27197 行/total=7507353979 + marvis 76 行 python↔Rust 逐事件一致**；4 条合成单测（zcode total 兜底/opencode 新表覆盖/dsh zstd/gemini 估算）；**4 条变异红**还原零残留。全量 **472 项 = 439 过 / 0 失败 / 33 忽略**（467→472 +5）。dsh 真实 173 文件全为 session 类型无 usage（python 亦 None），合成 fixture 验证口径。privacy 0 findings。**已提交 399d7af**。至此 usage-local.py 全部产品（codex/messages/DB/dsh/gemini）Rust 解析完成，python 仅作回退保底 |
 | **T18 第一批**（2026-11-20，用户「继续推进」） | `trae-gateway-clean.py` 迁 Rust：新增 `trae_clean.rs`（clean_db：ItemTable model_list_map 网关条目识别+删除+选择记录剪枝，is_gateway/has_token 整标识符边界/prune_selection）；`gateway_cleanup.rs run_script` 接线 Rust 优先失败回退 python | **跨语言 golden**：合成 state.vscdb python run vs Rust clean_db 输出+写回后库内容逐字段一致（removed=3 keys=3）。6 条单测绿；**2 条变异红**（has_token 去 ./ 边界/is_gateway 恒假）还原零残留。全量 **478 项 = 445 过 / 0 失败 / 33 忽略**（472→478 +6）。privacy 0 findings。**已提交 c49df32** |
 | **T18 第二批**（2026-11-20，用户「继续推进」） | `zcode-auth.py` 迁 Rust：新增 `zcode_auth.rs`（identity/snapshot/proxy_credential/merge/run，enc:v1: AES-GCM 解密用 T14 agentcrypt）；`zcode.rs helper` 接线 Rust 优先失败回退 python | **跨语言加密 golden**：python cryptography 加密合成 record → Rust 解密，identity/snapshot/merge/merge_logout 四模式输出逐字段一致。9 条单测绿（含加密 round-trip）；**2 条变异红**（merge 去前缀过滤/identity 去 access 判空）还原零残留。全量 **487 项 = 454 过 / 0 失败 / 33 忽略**（478→487 +9）。privacy 0 findings。**已提交 dcf0e55** |
+| **T18 第三批**（2026-11-20，用户「继续推进 T18 第三批」） | `chatgpt-history.py` 的**项目修复路径**迁 Rust：新增 `chatgpt_history_repair.rs`（project_repair_plan/repair_projects，ordinary 路径校验/key normcase/project_visibility_state/database_paths/primary_state_db/project_rows/计划识别/apply 备份+事务删除+失败回滚）；`chatgpt_history.rs run_script` 接线 repair_projects mode Rust 优先失败回退 python。**范围红线**：copy_history/shared-history/sync 涉及目录 junction/整库复制/WAL 退役/凭据隔离，属数据丢失级，**仍走 python 不触碰**。rusqlite 加 backup feature | **跨语言 golden**：合成 source/target（state_5.sqlite+state JSON+marker）python plan/apply vs Rust 逐字段一致 + apply 后 state/db 内容比对。12 条单测绿（dry_run/apply 备份/expected_plan 校验/所有权/重叠/has_thread 守卫/key/visibility）；**3 条变异红**（时间窗收紧/所有权反转/has_thread 禁用）还原零残留。全量 **499 项 = 466 过 / 0 失败 / 33 忽略**（487→499 +12）。privacy 0 findings。**已提交 eb285ae** |
 
 **顺带修掉的 4 套既有测试缺陷**（都不是本轮引入，在 Chrome 上同样会红）：
 - `add-app-picker` / `external-checkin` / `checkin-pending-day` / `workbuddy-accounts`：未屏蔽新手引导，
@@ -272,8 +273,8 @@
   T14 加密原语 + T15 原生 DPAPI 地基已建（见上表），但**未接任何生产加解密路径**；PowerShell 与 Python 冷启开销本轮**不会消失**。
   T16 需改 vendored agenthub.py（触「不整体重写 agenthub」红线）。
   （T1/T6/T9/T11/T7/T12/T14地基/T15地基/T5集成/T19评估 已于 2026-11-19 完成；**T17 第一/二/三阶段**已于 11-19/11-20 完成并提交，
-  usage-local.py 全部产品 Rust 解析完成，python 仅作回退保底。**T18 第一批 trae-gateway-clean / 第二批 zcode-auth** 已于 11-20 完成并提交。
-  **T18 第三批 chatgpt-history*.py（1652 行）暂缓**：涉及目录 junction/文件合并/SQLite WAL 退役/凭据隔离，属数据丢失级，
+  usage-local.py 全部产品 Rust 解析完成，python 仅作回退保底。**T18 第一批 trae-gateway-clean / 第二批 zcode-auth / 第三批 chatgpt-history 项目修复** 已于 11-20 完成并提交。
+  **T18 剩余 copy_history/shared-history/sync 三条路径暂缓**：涉及目录 junction/整库复制/SQLite WAL 退役/凭据隔离，属数据丢失级，
   须真实登录态 golden 样本 + 单独授权，不在本轮擅自迁移。）
 
 ---
