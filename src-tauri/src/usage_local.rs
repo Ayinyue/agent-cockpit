@@ -1,8 +1,8 @@
 // T17（阶段四）：usage-local 迁 Rust。
 // 第一阶段：codex 解析 + SQLite 增量缓存（8809178）。
-// 第二阶段（本批）：messages 系解析——claude/claude-code/qoder/qoder-cn/qoderwork/
+// 第二阶段：messages 系解析（73f7a53）——claude/claude-code/qoder/qoder-cn/qoderwork/
 // qwenwork/qwenworkcn/workbuddy/workbuddy-intl/codebuddy/codebuddy-cn/minimax。
-// DB 系（zcode/opencode/marvis/astudio）、dsh/gemini 仍在 python（第三阶段）。
+// 第三阶段（本批）：DB 系（zcode/opencode/marvis/astudio）+ dsh(zstd) + gemini。
 //
 // 计划 §4.4.2 红线：**不做 1:1 翻译**。python 版每轮把整个事件缓存 json.loads/dumps
 // （67.8MB 单轮 ~7.7s，2026-11-18 实测）；这里借迁移换 SQLite：按源文件指纹
@@ -12,12 +12,15 @@
 // - codex token_count 取累计终值差分；配额刷新重复帧跳过；last 兜底
 // - messages：session:messageId 分组、fragment 去重、CJK 可见文本估算、
 //   claude/minimax/standard 三种 usage 风格（wb/codebuddy 用 standard）
+// - DB 系：只读 sqlite（mode=ro + query_only），逐行 event；zcode 取 provider/computed
+//   total 兜底；opencode 新表覆盖旧表 id；marvis 逐行；astudio 拆 report_json.model_usages
+// - dsh：zstd 解压后逐行 assistant/message；gemini：整包 JSON messages 数组
 // - 事件 id = sha256(identity)，identity 含 sorted-keys JSON（与 python json.dumps(sort_keys=True) 对齐）
 // - 按天归日用本机时区；date-only 不伪造午夜事件
 // - 聚合去重键 session|id，取 (exact,tokens) 最大者
 //
-// 接线（usage.rs）：codex/chatgpt + messages 系走 Rust，失败回退 python；
-// DB 系/dsh/gemini 仍 python。python 回退路径不删，迁移期互为保底。
+// 接线（usage.rs）：codex/chatgpt + messages 系 + DB 系/dsh/gemini 走 Rust，失败回退 python；
+// python 回退路径不删，迁移期互为保底。
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -391,7 +394,7 @@ pub fn message_file(path: &Path, app: &str) -> Result<Vec<Value>, String> {
         let provider_text = if is_truthy(&group.provider) { py_str(&group.provider) } else { String::new() };
         records.push(event(&key, session_part, &group.timestamp, &model_text, &group.usage,
             EventOpts { provider: &provider_text, style, estimated: inp + out,
-                        input_estimate: inp, output_estimate: out, failure: false }));
+                        input_estimate: inp, output_estimate: out, failure: false, ..Default::default() }));
     }
     Ok(records)
 }
@@ -404,12 +407,14 @@ struct EventOpts<'a> {
     input_estimate: f64,
     output_estimate: f64,
     failure: bool,
+    duration: &'a Value,
+    ttft: &'a Value,
 }
 
 impl Default for EventOpts<'_> {
     fn default() -> Self {
         Self { provider: "", style: "standard", estimated: 0.0, input_estimate: 0.0,
-               output_estimate: 0.0, failure: false }
+               output_estimate: 0.0, failure: false, duration: &Value::Null, ttft: &Value::Null }
     }
 }
 
@@ -439,6 +444,18 @@ fn event(identity: &str, session: &str, timestamp: &Value, model: &str, usage: &
     row["cached_tokens"] = json!(cache);
     row["requests"] = json!(1.0);
     row["failures"] = json!(if opts.failure { 1.0 } else { 0.0 });
+    // python event()：exact>0 且 o>0 且 duration>0 才记计时字段；ttft>0 记 ttft。
+    let duration = number(opts.duration);
+    if exact > 0.0 && o > 0.0 && duration > 0.0 {
+        row["timed_output_tokens"] = json!(o);
+        row["duration_ms"] = json!(duration);
+        row["timing_samples"] = json!(1.0);
+    }
+    let ttft = number(opts.ttft);
+    if ttft > 0.0 {
+        row["ttft_ms"] = json!(ttft);
+        row["ttft_samples"] = json!(1.0);
+    }
     row
 }
 
@@ -559,6 +576,11 @@ pub fn is_messages_app(app: &str) -> bool {
     matches!(app, "claude" | "claude-code" | "qoder" | "qoder-cn" | "qoderwork"
         | "qwenwork" | "qwenworkcn" | "workbuddy" | "workbuddy-intl"
         | "codebuddy" | "codebuddy-cn" | "minimax")
+}
+
+/// 第三阶段产品：DB 系 / dsh / gemini（与 python paths_for 的剩余分支一致）。
+pub fn is_other_app(app: &str) -> bool {
+    matches!(app, "zcode" | "opencode" | "marvis" | "astudio" | "dsh" | "gemini" | "gemini-cli")
 }
 
 /// messages 系源文件清单：claude/qoder/workbuddy 等扫 projects/**/*.jsonl；
@@ -879,6 +901,319 @@ pub fn collect_messages(app: &str, root: &Path, cache_dir: Option<&Path>, with_r
         move |p| message_file(p, &app_owned))
 }
 
+/// 第三阶段：DB 系 / dsh / gemini 采集入口（与 python collect 同契约）。
+pub fn collect_other(app: &str, root: &Path, cache_dir: Option<&Path>, with_records: bool) -> Result<Option<Value>, String> {
+    if !root.is_dir() { return Ok(None); }
+    let (paths, parser_version, parse): (Vec<PathBuf>, &str, Box<dyn Fn(&Path) -> Result<Vec<Value>, String>>) =
+        match app {
+            "zcode" => (db_paths(root, &["cli/db/db.sqlite"]), "rust-zcode/1", Box::new(zcode_db)),
+            "opencode" => {
+                let candidates = [root.join("opencode.db"), root.join("data/opencode.db")];
+                let paths: Vec<PathBuf> = candidates.into_iter().filter(|p| p.is_file()).take(1).collect();
+                (paths, "rust-opencode/1", Box::new(opencode_db))
+            }
+            "marvis" => (db_paths(root, &["database/data.db"]), "rust-marvis/1", Box::new(marvis_db)),
+            "astudio" => (db_paths(root, &["state.sqlite"]), "rust-astudio/1", Box::new(astudio_db)),
+            "dsh" => (glob_files(&root.join("sessions"), "session.v4.jsonl.zstd"), "rust-dsh/1", Box::new(dsh_file)),
+            "gemini" | "gemini-cli" => (gemini_paths(root), "rust-gemini/1", Box::new(gemini_file)),
+            _ => return Ok(None),
+        };
+    collect_files(app, root, cache_dir, with_records, paths, parser_version, move |p| parse(p))
+}
+
+/// DB 系单文件清单（与 python paths_for 的固定路径分支对齐）：只收存在的文件。
+fn db_paths(root: &Path, rels: &[&str]) -> Vec<PathBuf> {
+    rels.iter().map(|r| root.join(r)).filter(|p| p.is_file()).collect()
+}
+
+/// 递归收集指定文件名（dsh 的 session.v4.jsonl.zstd）。
+fn glob_files(base: &Path, name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if !base.is_dir() { return out; }
+    let mut stack = vec![base.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() { stack.push(p); }
+            else if p.file_name().map(|n| n == name).unwrap_or(false) { out.push(p); }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// gemini 源清单：tmp/**/chats/session-*.json（与 python paths_for 对齐）。
+fn gemini_paths(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let base = root.join("tmp");
+    if !base.is_dir() { return out; }
+    let mut stack = vec![base];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() { stack.push(p); }
+            else if p.file_name().map(|n| {
+                let n = n.to_string_lossy();
+                n.starts_with("session-") && n.ends_with(".json")
+            }).unwrap_or(false) {
+                if p.parent().and_then(|d| d.file_name()).map(|n| n == "chats").unwrap_or(false) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 只读打开 sqlite（与 python connect 对齐：mode=ro + query_only）。
+fn open_ro(path: &Path) -> Result<rusqlite::Connection, String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI)
+        .map_err(|e| e.to_string())?;
+    conn.pragma_update(None, "query_only", "ON").ok();
+    Ok(conn)
+}
+
+/// 把一行 sqlite 结果转成 JSON object（列名→值，python dict(row) 同口径）。
+fn row_to_json(row: &rusqlite::Row, cols: &[String]) -> Result<Value, String> {
+    let mut obj = serde_json::Map::new();
+    for (i, name) in cols.iter().enumerate() {
+        let v = row.get_ref(i).map_err(|e| e.to_string())?;
+        let val = match v {
+            rusqlite::types::ValueRef::Null => Value::Null,
+            rusqlite::types::ValueRef::Integer(n) => json!(n),
+            rusqlite::types::ValueRef::Real(f) => json!(f),
+            rusqlite::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+            rusqlite::types::ValueRef::Blob(_) => Value::Null,
+        };
+        obj.insert(name.clone(), val);
+    }
+    Ok(Value::Object(obj))
+}
+
+/// 读全表为 JSON object 列表。optional=true 时表不存在返回空。
+fn sql_rows(conn: &rusqlite::Connection, table: &str, optional: bool) -> Result<Vec<Value>, String> {
+    let sql = format!("SELECT * FROM \"{}\"", table);
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            if optional && e.to_string().contains("no such table") { return Ok(Vec::new()); }
+            return Err(e.to_string());
+        }
+    };
+    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let rows = stmt.query_map([], |row| {
+        row_to_json(row, &cols).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))))
+    }).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+    Ok(out)
+}
+
+/// zcode model_usage 请求库（与 python zcode_db 逐条对齐）。
+pub fn zcode_db(path: &Path) -> Result<Vec<Value>, String> {
+    let conn = open_ro(path)?;
+    let mut records = Vec::new();
+    for row in sql_rows(&conn, "model_usage", false)? {
+        let total = {
+            let t = first_number(&row, &["provider_total_tokens", "computed_total_tokens"]);
+            if t <= 0.0 { first_number(&row, &["computed_total_tokens"]) } else { t }
+        };
+        let mut u = row.clone();
+        if total > 0.0 { u["total_tokens"] = json!(total); }
+        let failure = row.get("status").and_then(|v| v.as_str())
+            .map(|s| s == "error" || s == "failed").unwrap_or(false);
+        let duration = row.get("duration_ms").cloned().unwrap_or(Value::Null);
+        let ttft = row.get("time_to_first_token_ms").cloned().unwrap_or(Value::Null);
+        records.push(event(
+            &py_str(row.get("id").unwrap_or(&Value::Null)),
+            &py_str(row.get("session_id").unwrap_or(&Value::Null)),
+            row.get("started_at").unwrap_or(&Value::Null),
+            &py_str(row.get("model_id").unwrap_or(&Value::Null)),
+            &u,
+            EventOpts { provider: &py_str(row.get("provider_id").unwrap_or(&Value::Null)),
+                        failure, duration: &duration, ttft: &ttft, ..Default::default() }));
+    }
+    Ok(records)
+}
+
+/// opencode 请求库（与 python opencode_db 逐条对齐）：新表 session_message 覆盖旧表 message 的同 id。
+pub fn opencode_db(path: &Path) -> Result<Vec<Value>, String> {
+    let conn = open_ro(path)?;
+    let mut records: HashMap<String, Value> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for table in ["message", "session_message"] {
+        for row in sql_rows(&conn, table, true)? {
+            let data: Value = row.get("data").and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(json!({}));
+            let role = row.get("type").and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| data.get("role").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            if role != "assistant" { continue; }
+            let model = match data.get("model") {
+                Some(m) if m.is_object() => m.clone(),
+                Some(m) if !m.is_null() => json!({"id": m}),
+                _ => json!({}),
+            };
+            let timing = data.get("time").filter(|t| t.is_object()).cloned().unwrap_or(json!({}));
+            let start = number(timing.get("created").unwrap_or(&Value::Null));
+            let end = number(timing.get("completed").unwrap_or(&Value::Null));
+            let first = number(timing.get("streamed").unwrap_or(&Value::Null));
+            let model_id = first_truthy(&[model.get("id"), data.get("modelID")])
+                .map(py_str).unwrap_or_default();
+            let provider = first_truthy(&[model.get("providerID"), data.get("providerID")])
+                .map(py_str).unwrap_or_default();
+            let failure = data.get("error").map(is_truthy).unwrap_or(false);
+            let duration = if end > start && start > 0.0 { json!(end - start) } else { json!(0.0) };
+            let ttft = if first > start && start > 0.0 { json!(first - start) } else { json!(0.0) };
+            let id = py_str(row.get("id").unwrap_or(&Value::Null));
+            let ev = event(
+                &py_str(row.get("id").unwrap_or(&Value::Null)),
+                &py_str(row.get("session_id").unwrap_or(&Value::Null)),
+                row.get("time_created").unwrap_or(&Value::Null),
+                &model_id,
+                data.get("tokens").unwrap_or(&Value::Null),
+                EventOpts { provider: &provider, style: "opencode", failure,
+                            duration: &duration, ttft: &ttft, ..Default::default() });
+            if !records.contains_key(&id) { order.push(id.clone()); }
+            records.insert(id, ev);
+        }
+    }
+    Ok(order.into_iter().map(|id| records.remove(&id).unwrap()).collect())
+}
+
+/// marvis 日用量库（与 python marvis_db 逐条对齐）。
+pub fn marvis_db(path: &Path) -> Result<Vec<Value>, String> {
+    let conn = open_ro(path)?;
+    let mut records = Vec::new();
+    for (index, row) in sql_rows(&conn, "llm_token_usage", false)?.into_iter().enumerate() {
+        let id = row.get("id").filter(|v| !v.is_null()).cloned().unwrap_or(json!(index));
+        let model = first_truthy(&[row.get("model_id"), row.get("model"), row.get("model_name")])
+            .map(py_str).unwrap_or_default();
+        let usage = json!({
+            "total_tokens": row.get("total_tokens").unwrap_or(&Value::Null),
+            "input_tokens": row.get("input_tokens").unwrap_or(&Value::Null),
+            "output_tokens": row.get("output_tokens").unwrap_or(&Value::Null),
+            "cached_input_tokens": row.get("cached_tokens").unwrap_or(&Value::Null),
+        });
+        records.push(event(
+            &py_str(&id),
+            &py_str(row.get("conversation_id").unwrap_or(&Value::Null)),
+            row.get("usage_date").unwrap_or(&Value::Null),
+            &model, &usage, EventOpts::default()));
+    }
+    Ok(records)
+}
+
+/// astudio 逐轮计费报告（与 python astudio_db 逐条对齐）：拆 report_json.model_usages。
+pub fn astudio_db(path: &Path) -> Result<Vec<Value>, String> {
+    let conn = open_ro(path)?;
+    let mut records = Vec::new();
+    for row in sql_rows(&conn, "turn_billing_outbox", true)? {
+        let payload = row.get("report_json").and_then(|v| v.as_str()).unwrap_or("");
+        if payload.is_empty() { continue; }
+        let Ok(report) = serde_json::from_str::<Value>(payload) else { continue };
+        if !report.is_object() { continue; }
+        let stamp = first_truthy(&[report.get("started_at"), report.get("completed_at")])
+            .cloned().unwrap_or(Value::Null);
+        let session = first_truthy(&[report.get("session_id"), report.get("thread_id")])
+            .map(py_str).unwrap_or_default();
+        let failed = report.get("turn_status").map(|v| py_str(v).to_lowercase())
+            .map(|s| s == "failed" || s == "error" || s == "cancelled").unwrap_or(false);
+        let usages = match report.get("model_usages") {
+            Some(Value::Array(a)) => a.clone(),
+            _ => continue,
+        };
+        for (index, usage) in usages.into_iter().enumerate() {
+            if !usage.is_object() { continue; }
+            let model = first_truthy(&[usage.get("effective_model"), usage.get("requested_model")])
+                .map(py_str).unwrap_or_default();
+            let identity = format!("{}:{}:{}",
+                py_str(row.get("billing_turn_id").unwrap_or(&Value::Null)), index, model);
+            let session_final = if session.is_empty() {
+                py_str(row.get("billing_account_id").unwrap_or(&Value::Null))
+            } else { session.clone() };
+            let provider = usage.get("provider").map(py_str).unwrap_or_default();
+            records.push(event(&identity, &session_final, &stamp, &model, &usage,
+                EventOpts { provider: &provider, failure: failed, ..Default::default() }));
+        }
+    }
+    Ok(records)
+}
+
+/// dsh 会话日志（zstd 压缩，与 python dsh_file 逐条对齐）。
+pub fn dsh_file(path: &Path) -> Result<Vec<Value>, String> {
+    let raw = std::fs::read(path).map_err(|_| "读取会话日志失败".to_string())?;
+    let decoded = zstd::decode_all(&raw[..]).map_err(|_| "zstd 解压失败".to_string())?;
+    let text = String::from_utf8_lossy(&decoded);
+    let session = path.parent().and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let mut records = Vec::new();
+    let mut index = 0usize;
+    for line in py_lines(&text) {
+        let Ok(item) = serde_json::from_str::<Value>(line) else { continue };
+        if !item.is_object() { continue; }
+        let cur_index = index;
+        index += 1;
+        if item.get("type").and_then(|v| v.as_str()) != Some("assistant/message") { continue; }
+        let data = item.get("data").filter(|d| d.is_object()).cloned().unwrap_or(json!({}));
+        let usage = match data.get("usage") {
+            Some(u) if u.is_object() => u.clone(),
+            _ => continue,
+        };
+        let id = first_truthy(&[data.get("id"), item.get("id")])
+            .cloned().unwrap_or(json!(cur_index));
+        let model = data.get("model").map(py_str).unwrap_or_default();
+        records.push(event(&py_str(&id), &session,
+            item.get("time").unwrap_or(&Value::Null), &model, &usage, EventOpts::default()));
+    }
+    Ok(records)
+}
+
+/// gemini 整包 JSON（与 python gemini_file 逐条对齐）：messages 数组，user 累计估算。
+pub fn gemini_file(path: &Path) -> Result<Vec<Value>, String> {
+    let text = std::fs::read_to_string(path).map_err(|_| "读取会话日志失败".to_string())?;
+    let data: Value = serde_json::from_str(&text).map_err(|_| "JSON 解析失败".to_string())?;
+    let session = first_truthy(&[data.get("sessionId")])
+        .map(py_str)
+        .unwrap_or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
+    let messages = match data.get("messages") {
+        Some(Value::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    };
+    let mut records = Vec::new();
+    let mut pending_input = 0.0f64;
+    for (index, row) in messages.into_iter().enumerate() {
+        let typ = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if typ == "user" {
+            pending_input += estimate(&visible_text(row.get("content").unwrap_or(&Value::Null)));
+            continue;
+        }
+        if typ != "gemini" && typ != "model" && typ != "assistant" { continue; }
+        let tokens = row.get("tokens").filter(|t| t.is_object()).cloned().unwrap_or(json!({}));
+        let usage = json!({
+            "input_tokens": tokens.get("input").unwrap_or(&Value::Null),
+            "output_tokens": tokens.get("output").unwrap_or(&Value::Null),
+            "total_tokens": tokens.get("total").unwrap_or(&Value::Null),
+            "cached_input_tokens": tokens.get("cached").unwrap_or(&Value::Null),
+        });
+        let out = estimate(&visible_text(row.get("content").unwrap_or(&Value::Null)));
+        let id = row.get("id").filter(|v| !v.is_null()).cloned().unwrap_or(json!(index));
+        let model = row.get("model").map(py_str).unwrap_or_default();
+        records.push(event(&py_str(&id), &session,
+            row.get("timestamp").unwrap_or(&Value::Null), &model, &usage,
+            EventOpts { provider: "google", estimated: pending_input + out,
+                        input_estimate: pending_input, output_estimate: out, ..Default::default() }));
+        pending_input = 0.0;
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1332,21 @@ mod tests {
         let py: Value = serde_json::from_str(&std::fs::read_to_string(&py_path).unwrap()).unwrap();
         let with_records = py.get("_records").is_some();
         let rs = collect_messages(&app, Path::new(&fixture_dir), None, with_records).unwrap().expect("Rust 应聚出结果");
+        assert_golden_eq(&rs, &py, with_records);
+    }
+
+    /// T17 第三阶段 golden：DB 系/dsh/gemini（app 由 T17O_GOLDEN_APP 指定）与 python 逐字段比对。
+    #[test]
+    fn golden_other_matches_python() {
+        let Ok(fixture_dir) = std::env::var("T17O_GOLDEN_FIXTURE") else {
+            eprintln!("跳过 golden：未设 T17O_GOLDEN_FIXTURE");
+            return;
+        };
+        let app = std::env::var("T17O_GOLDEN_APP").expect("应有 app");
+        let py_path = std::env::var("T17O_GOLDEN_PY_RESULT").expect("应有 python 结果路径");
+        let py: Value = serde_json::from_str(&std::fs::read_to_string(&py_path).unwrap()).unwrap();
+        let with_records = py.get("_records").is_some();
+        let rs = collect_other(&app, Path::new(&fixture_dir), None, with_records).unwrap().expect("Rust 应聚出结果");
         assert_golden_eq(&rs, &py, with_records);
     }
 
@@ -1176,5 +1526,107 @@ mod tests {
         let a = v["_records"].as_array().unwrap().iter().find(|r| r["id"] == "a").unwrap();
         assert_eq!(a["tokens"].as_f64(), Some(50.0), "同 identity 应取最大帧");
         assert_eq!(v["total"].as_f64(), Some(55.0));
+    }
+
+    /// 第三阶段：zcode model_usage 合成 fixture（total 兜底 + failure + duration/ttft）。
+    #[test]
+    fn zcode_db_synthetic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("db.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE model_usage(id TEXT, session_id TEXT, started_at TEXT, model_id TEXT,
+             provider_id TEXT, status TEXT, duration_ms INTEGER, time_to_first_token_ms INTEGER,
+             provider_total_tokens INTEGER, computed_total_tokens INTEGER,
+             input_tokens INTEGER, output_tokens INTEGER);
+             INSERT INTO model_usage VALUES('r1','s1','2026-05-27T06:00:00Z','m1','p1','ok',1200,300,100,90,60,30);
+             INSERT INTO model_usage VALUES('r2','s1','2026-05-27T07:00:00Z','m1','p1','error',0,0,0,50,20,10);
+             INSERT INTO model_usage VALUES('r3','s2','2026-05-27T08:00:00Z','m2','p2','ok',500,0,0,0,40,15);").unwrap();
+        drop(conn);
+        let recs = zcode_db(&db).unwrap();
+        assert_eq!(recs.len(), 3);
+        // r1: provider_total=100 优先；duration/ttft 记计时
+        assert_eq!(recs[0]["tokens"].as_f64(), Some(100.0));
+        assert_eq!(recs[0]["duration_ms"].as_f64(), Some(1200.0));
+        assert_eq!(recs[0]["ttft_ms"].as_f64(), Some(300.0));
+        assert_eq!(recs[0]["failures"].as_f64(), Some(0.0));
+        // r2: provider_total=0 → computed=50 兜底；status=error → failure=1
+        assert_eq!(recs[1]["tokens"].as_f64(), Some(50.0));
+        assert_eq!(recs[1]["failures"].as_f64(), Some(1.0));
+        // r3: 两者都 0 → total 由 input+output 重算（standard style）=55
+        assert_eq!(recs[2]["tokens"].as_f64(), Some(55.0));
+    }
+
+    /// 第三阶段：opencode 新表覆盖旧表同 id + tokens 解析 + opencode style（reasoning 单列）。
+    #[test]
+    fn opencode_db_synthetic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message(id TEXT, session_id TEXT, time_created TEXT, type TEXT, data TEXT);
+             CREATE TABLE session_message(id TEXT, session_id TEXT, time_created TEXT, type TEXT, data TEXT);
+             INSERT INTO message VALUES('a','s','2026-05-27T06:00:00Z','assistant',
+               '{\"model\":{\"id\":\"m\",\"providerID\":\"p\"},\"tokens\":{\"input\":10,\"output\":5,\"reasoning\":3},\"time\":{\"created\":1000,\"completed\":2000,\"streamed\":1200}}');
+             INSERT INTO session_message VALUES('a','s','2026-05-27T06:00:00Z','assistant',
+               '{\"model\":{\"id\":\"m2\",\"providerID\":\"p2\"},\"tokens\":{\"input\":20,\"output\":8,\"reasoning\":4},\"time\":{\"created\":1000,\"completed\":3000,\"streamed\":1500}}');").unwrap();
+        drop(conn);
+        let recs = opencode_db(&db).unwrap();
+        assert_eq!(recs.len(), 1, "新表应覆盖旧表同 id");
+        // 新表 tokens：input20+output8+reasoning4=32（opencode exclusive 不含 cache）
+        assert_eq!(recs[0]["tokens"].as_f64(), Some(32.0));
+        assert_eq!(recs[0]["model"].as_str(), Some("m2"));
+        assert_eq!(recs[0]["duration_ms"].as_f64(), Some(2000.0)); // 3000-1000
+        assert_eq!(recs[0]["ttft_ms"].as_f64(), Some(500.0)); // 1500-1000
+    }
+
+    /// 第三阶段：dsh zstd 解压 + assistant/message 过滤 + index 兜底。
+    #[test]
+    fn dsh_file_synthetic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sess-abc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines = [
+            r#"{"type":"session","data":{"id":"x"}}"#,
+            r#"{"type":"assistant/message","time":"2026-05-27T06:00:00Z","data":{"id":"d1","model":"m","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}"#,
+            r#"{"type":"assistant/message","time":"2026-05-27T06:01:00Z","data":{"model":"m","usage":{"input_tokens":20,"output_tokens":7,"total_tokens":27}}}"#,
+            r#"{"type":"user","data":{"content":"hi"}}"#,
+        ];
+        let raw = lines.join("\n");
+        let compressed = zstd::encode_all(raw.as_bytes(), 3).unwrap();
+        std::fs::write(dir.join("session.v4.jsonl.zstd"), compressed).unwrap();
+        let recs = dsh_file(&dir.join("session.v4.jsonl.zstd")).unwrap();
+        assert_eq!(recs.len(), 2, "只计 assistant/message 且 usage 为 dict");
+        assert_eq!(recs[0]["session"].as_str(), Some("sess-abc"), "session 取父目录名");
+        assert_eq!(recs[0]["tokens"].as_f64(), Some(15.0));
+        assert_eq!(recs[1]["tokens"].as_f64(), Some(27.0));
+    }
+
+    /// 第三阶段：gemini 整包 JSON + user 累计估算 + google provider。
+    #[test]
+    fn gemini_file_synthetic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("session-x.json");
+        let data = json!({
+            "sessionId": "g-sess",
+            "messages": [
+                {"type": "user", "content": [{"type": "text", "text": "你好世界"}]},
+                {"type": "gemini", "id": "g1", "model": "gemini-2", "timestamp": "2026-05-27T06:00:00Z",
+                 "content": [{"type": "text", "text": "abcd"}],
+                 "tokens": {"input": 10, "output": 5, "total": 15, "cached": 2}},
+                {"type": "model", "id": "g2", "model": "gemini-2", "timestamp": "2026-05-27T06:01:00Z",
+                 "content": "你好"},
+            ]
+        });
+        std::fs::write(&f, serde_json::to_string(&data).unwrap()).unwrap();
+        let recs = gemini_file(&f).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0]["session"].as_str(), Some("g-sess"));
+        assert_eq!(recs[0]["provider"].as_str(), Some("google"));
+        assert_eq!(recs[0]["tokens"].as_f64(), Some(15.0)); // 有 usage 用 exact
+        assert_eq!(recs[0]["cached_tokens"].as_f64(), Some(2.0));
+        // g2 无 tokens → 估算：pending_input 已被 g1 消费重置为 0，仅输出"你好"=2
+        assert_eq!(recs[1]["tokens"].as_f64(), Some(2.0));
+        assert_eq!(recs[1]["estimated_tokens"].as_f64(), Some(2.0));
     }
 }
