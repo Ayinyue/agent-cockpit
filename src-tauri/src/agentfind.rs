@@ -195,6 +195,12 @@ fn python_command(python: &Path) -> Command {
 }
 
 fn stop_legacy(python: &Path, script: &Path, dir: &Path, default: u16) {
+    // T19 部分迁：优先用 Rust 原生进程管理停掉旧版 AgentFind（sysinfo 枚举命令行 +
+    // procs::kill_pids），免起一个 python --stop 子进程再让它调 PowerShell+taskkill。
+    // 失败回退原 python --stop 路径（迁移期互为保底）。
+    if stop_legacy_native(dir, default) {
+        return;
+    }
     let mut child = match python_command(python)
         .arg(script)
         .arg("--stop")
@@ -214,6 +220,34 @@ fn stop_legacy(python: &Path, script: &Path, dir: &Path, default: u16) {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// 与 python cmd_stop 同口径：按命令行匹配全部 agentfind.py 服务进程（不只端口上那一个，
+/// Windows allow_reuse_address 允许多进程绑同口），排除自身，taskkill /t /f 整树结束。
+/// 返回 true 表示已尝试原生停止（无论是否找到进程）；调用方随后复查 legacy_running。
+fn stop_legacy_native(dir: &Path, default: u16) -> bool {
+    let snap = crate::procs::snapshot_fresh();
+    let self_pid = std::process::id();
+    let pids: Vec<u32> = snap
+        .iter()
+        .filter(|(pid, info)| is_agentfind_service(**pid, info, self_pid))
+        .map(|(pid, _)| *pid)
+        .collect();
+    if !pids.is_empty() {
+        crate::procs::kill_pids(&pids);
+    }
+    // 给 OS 一点时间回收端口；复查是否还有旧版在跑。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while legacy_running(dir, default) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    !legacy_running(dir, default)
+}
+
+/// 进程匹配谓词（与 python cmd_stop 同口径）：name 以 python 开头 + cmdline 含 agentfind.py + 排除自身。
+/// 抽成独立函数便于单测钉住口径（stop_legacy_native 与测试共用）。
+fn is_agentfind_service(pid: u32, info: &crate::procs::ProcInfo, self_pid: u32) -> bool {
+    pid != self_pid && info.name.starts_with("python") && info.cmdline.contains("agentfind.py")
 }
 
 fn service_log(dir: &Path) -> (Stdio, Stdio) {
@@ -401,5 +435,37 @@ mod tests {
         let path = absolute(PathBuf::from(".agentfind"));
         assert!(path.is_absolute());
         assert!(path.ends_with(".agentfind"));
+    }
+
+    /// T19 部分迁：原生停止的进程匹配口径与 python cmd_stop 一致——
+    /// name 以 python 开头 + cmdline 含 agentfind.py + 排除自身。
+    #[test]
+    fn native_stop_matches_agentfind_python_only() {
+        use crate::procs::ProcInfo;
+        use std::collections::HashMap;
+        let mut snap: HashMap<u32, ProcInfo> = HashMap::new();
+        let self_pid = std::process::id();
+        // 命中：python + agentfind.py
+        snap.insert(1001, ProcInfo { name: "python.exe".into(),
+            cmdline: "python -i -b -u -x utf8 c:/x/agentfind.py --no-open".into() });
+        // 命中：python3.14 变体
+        snap.insert(1002, ProcInfo { name: "python3.14.exe".into(),
+            cmdline: "c:/py/python3.14.exe c:/x/agentfind.py".into() });
+        // 不命中：自身（即使跑 agentfind.py）
+        snap.insert(self_pid, ProcInfo { name: "python.exe".into(),
+            cmdline: "python c:/x/agentfind.py".into() });
+        // 不命中：非 python 进程含 agentfind.py 字样
+        snap.insert(1003, ProcInfo { name: "agentcockpit.exe".into(),
+            cmdline: "agentcockpit.exe --note agentfind.py".into() });
+        // 不命中：python 但不含 agentfind.py
+        snap.insert(1004, ProcInfo { name: "python.exe".into(),
+            cmdline: "python c:/x/usage-local.py".into() });
+        let pids: Vec<u32> = snap.iter()
+            .filter(|(pid, info)| is_agentfind_service(**pid, info, self_pid))
+            .map(|(pid, _)| *pid)
+            .collect();
+        let mut sorted = pids.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![1001, 1002], "只匹配 python+agentfind.py 且排除自身");
     }
 }
