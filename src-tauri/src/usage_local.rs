@@ -66,6 +66,12 @@ fn is_truthy(v: &Value) -> bool {
     }
 }
 
+/// 跨模块复用（trae_clean 等）：python 真值语义。
+pub fn is_truthy_pub(v: &Value) -> bool { is_truthy(v) }
+
+/// 跨模块复用（trae_clean 等）：python str(value) 的 JSON 标量渲染。
+pub fn py_str_pub(v: &Value) -> String { py_str(v) }
+
 fn first_truthy<'a>(vals: &[Option<&'a Value>]) -> Option<&'a Value> {
     vals.iter().flatten().copied().find(|v| is_truthy(v))
 }

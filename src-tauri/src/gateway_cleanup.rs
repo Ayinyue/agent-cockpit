@@ -94,6 +94,13 @@ fn gateway_hosts(port: u16) -> Vec<String> {
 /// only the cached model list and the selection keys that named a removed
 /// model; credentials and conversations are never read.
 fn run_script(path: &Path, port: u16, limit: Duration) -> Result<Value> {
+    // T18：trae-gateway-clean 已迁 Rust（trae_clean::clean_db，golden 钉住与 python 逐字段一致）。
+    // 原生路径免 python 冷启；失败回退 python（迁移期互为保底）。
+    let hosts = gateway_hosts(port);
+    match crate::trae_clean::clean_db(path, &hosts) {
+        Ok(v) => return Ok(v),
+        Err(_) => { /* 回退 python */ }
+    }
     let python = crate::usage::bundled_python()?;
     let mut command = Command::new(python);
     command
