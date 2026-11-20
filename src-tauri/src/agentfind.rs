@@ -16,6 +16,9 @@ use std::{
 
 static START: Mutex<()> = Mutex::new(());
 const SCRIPT: &str = include_str!("../scripts/agentfind.py");
+/// T19 部分迁：728 行内嵌前端从 agentfind.py 挪到独立静态资源（纯搬运，字节不变）。
+/// 与脚本一起释放到 agentfind-runtime/，python 侧 _load_page() 从同目录读取。
+const PAGE_HTML: &str = include_str!("../scripts/agentfind-page.html");
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -74,20 +77,42 @@ fn script_file_at(dir: &Path) -> Result<PathBuf, String> {
         return Err("内置会话索引文件包含链接，已停止启动。".into());
     }
     let expected = SCRIPT.as_bytes();
-    if fs::read(&path).ok().as_deref() == Some(expected) {
+    let script_ok = fs::read(&path).ok().as_deref() == Some(expected);
+    let page_path = dir.join("agentfind-page.html");
+    let page_ok = !crate::registry::is_reparse_point(&page_path)
+        && fs::read(&page_path).ok().as_deref() == Some(PAGE_HTML.as_bytes());
+    if script_ok && page_ok {
         return Ok(path);
     }
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let staging = dir.join(format!(".agentfind-{}-{nonce}.py", std::process::id()));
-    fs::write(&staging, expected).map_err(|_| "无法释放内置会话索引组件，请检查磁盘空间。".to_string())?;
-    if fs::rename(&staging, &path).is_err() {
-        let _ = fs::remove_file(&staging);
-        // Another instance may have replaced it first; accept only identical bytes.
-        if fs::read(&path).ok().as_deref() != Some(expected) {
-            return Err("内置会话索引组件写入失败，请检查磁盘空间和权限。".into());
+    if !script_ok {
+        let staging = dir.join(format!(".agentfind-{}-{nonce}.py", std::process::id()));
+        fs::write(&staging, expected).map_err(|_| "无法释放内置会话索引组件，请检查磁盘空间。".to_string())?;
+        if fs::rename(&staging, &path).is_err() {
+            let _ = fs::remove_file(&staging);
+            // Another instance may have replaced it first; accept only identical bytes.
+            if fs::read(&path).ok().as_deref() != Some(expected) {
+                return Err("内置会话索引组件写入失败，请检查磁盘空间和权限。".into());
+            }
+        }
+    }
+    // T19 部分迁：前端静态资源与脚本同目录释放，字节相同复用，损坏修复。
+    if crate::registry::is_reparse_point(&page_path) {
+        return Err("内置会话索引前端资源包含链接，已停止启动。".into());
+    }
+    let page_expected = PAGE_HTML.as_bytes();
+    if fs::read(&page_path).ok().as_deref() != Some(page_expected) {
+        let page_staging = dir.join(format!(".agentfind-page-{}-{nonce}.html", std::process::id()));
+        fs::write(&page_staging, page_expected)
+            .map_err(|_| "无法释放内置会话索引前端资源，请检查磁盘空间。".to_string())?;
+        if fs::rename(&page_staging, &page_path).is_err() {
+            let _ = fs::remove_file(&page_staging);
+            if fs::read(&page_path).ok().as_deref() != Some(page_expected) {
+                return Err("内置会话索引前端资源写入失败，请检查磁盘空间和权限。".into());
+            }
         }
     }
     Ok(path)
@@ -377,6 +402,19 @@ mod tests {
         assert!(SCRIPT.contains("\"sessions_ui\": 1"));
     }
 
+    /// T19 部分迁：前端静态资源编进 exe，与 python _load_page 读取的字节一致。
+    #[test]
+    fn embedded_page_is_the_session_ui() {
+        assert!(PAGE_HTML.len() > 40_000, "AgentFind frontend must be compiled in");
+        assert!(PAGE_HTML.starts_with("<!doctype html>"));
+        assert!(PAGE_HTML.contains("AgentFind"));
+        assert!(PAGE_HTML.contains("</html>"));
+        // python 侧从独立文件加载，不再内嵌 PAGE 字符串
+        assert!(SCRIPT.contains("agentfind-page.html"));
+        assert!(SCRIPT.contains("_load_page"));
+        assert!(!SCRIPT.contains("PAGE = r\"\"\""), "PAGE 字符串应已挪出脚本");
+    }
+
     #[test]
     fn fingerprint_uses_standard_fnv1a_so_python_can_reproduce_it() {
         assert_eq!(fnv1a(b""), 0xcbf29ce484222325);
@@ -408,6 +446,12 @@ mod tests {
         fs::write(&first, b"stale").unwrap();
         let repaired = script_file_at(&temp.0).expect("repair embedded AgentFind");
         assert_eq!(fs::read(&repaired).unwrap(), SCRIPT.as_bytes());
+        // T19 部分迁：前端资源同目录释放，字节一致，损坏修复
+        let page = temp.0.join("agentfind-page.html");
+        assert_eq!(fs::read(&page).unwrap(), PAGE_HTML.as_bytes());
+        fs::write(&page, b"stale-page").unwrap();
+        script_file_at(&temp.0).expect("repair embedded AgentFind page");
+        assert_eq!(fs::read(&page).unwrap(), PAGE_HTML.as_bytes());
     }
 
     #[test]
