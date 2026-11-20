@@ -23,6 +23,10 @@ class SavedAccountQuota(unittest.TestCase):
             '_wb_fetch_usage': Mock(return_value=({'Packages': []}, None)),
             '_wb_pack_accounts': Mock(return_value=[]), '_wb_pack_expiry': Mock(return_value={}),
             '_wb_pack_items': Mock(return_value={}), '_wb_base': Mock(return_value='https://example.invalid'),
+            # 上游 v2.6.0 workbuddy_full 新增过期历史栏依赖（_wb_expired_accounts/items/category）；
+            # 隔离命名空间需一并 mock，否则 NameError。空返回=无过期历史，余额口径不受影响。
+            '_wb_expired_accounts': Mock(return_value=[]), '_wb_expired_items': Mock(return_value={}),
+            '_wb_category': Mock(return_value='其他'),
         }
         exec(compile(ast.Module(body=funcs, type_ignores=[]), str(SOURCE), 'exec'), ns)
         return ns

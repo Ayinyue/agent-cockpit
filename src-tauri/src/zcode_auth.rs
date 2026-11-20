@@ -12,7 +12,232 @@
 //! 本模块只读凭据 + 派生身份，不写任何生产凭据存储；merge 返回新 record 由调用方决定是否落盘。
 
 use serde_json::{json, Value};
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+
+/// enc:v2 密钥环条目后缀（与 python KEYRING_SUFFIX 一致）。
+const KEYRING_SUFFIX: &str = ".ZCode Credential Encryption";
+
+thread_local! {
+    /// 与 python 模块级 ROOT 对齐：run() 按请求设置，decode/os_key/env_key 读取。
+    /// 用 thread_local 而非全局 static：cargo 并行测试互不串扰（python 每进程一个 ROOT，
+    /// Rust 每线程一个，语义等价——helper 是单线程 stdin/stdout 管道）。
+    static ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+fn set_root(root: Option<PathBuf>) {
+    ROOT.with(|r| *r.borrow_mut() = root);
+}
+
+fn current_root() -> Option<PathBuf> {
+    ROOT.with(|r| r.borrow().clone())
+}
+
+/// 与 python default_root 对齐：ZCODE_HOME 或 ~/.zcode。
+fn default_root() -> PathBuf {
+    std::env::var_os("ZCODE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::registry::home().join(".zcode"))
+}
+
+/// 与 python fingerprint 对齐：sha256(key).hexdigest()[:24]。
+fn fingerprint(key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(key);
+    let out = h.finalize();
+    out.iter().take(12).map(|b| format!("{:02x}", b)).collect()
+}
+
+/// 与 python _key_from_text 对齐：base64url 解码，仅接受 32 字节。
+fn key_from_text(secret: &str) -> Option<[u8; 32]> {
+    if secret.is_empty() { return None; }
+    let bytes = b64url_decode(secret).ok()?;
+    if bytes.len() != 32 { return None; }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&bytes);
+    Some(k)
+}
+
+/// Windows 凭据库读取（与 python _win_cred_read/_win_cred_targets 对齐）。
+/// 仅 Windows；其它平台返回空（python sys.platform != 'win32' 同口径）。
+#[cfg(windows)]
+mod wincred {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    const CRED_TYPE_GENERIC: u32 = 1;
+
+    #[repr(C)]
+    struct FileTime { dw_low: u32, dw_high: u32 }
+
+    #[repr(C)]
+    struct CredentialW {
+        flags: u32,
+        cred_type: u32,
+        target_name: *const u16,
+        comment: *const u16,
+        last_written: FileTime,
+        credential_blob_size: u32,
+        credential_blob: *const u8,
+        persist: u32,
+        attribute_count: u32,
+        attributes: *const std::ffi::c_void,
+        target_alias: *const u16,
+        user_name: *const u16,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn CredReadW(target: *const u16, type_: u32, flags: u32, cred: *mut *mut CredentialW) -> i32;
+        fn CredEnumerateW(filter: *const u16, flags: u32, count: *mut u32, creds: *mut *mut *mut CredentialW) -> i32;
+        fn CredFree(buffer: *mut std::ffi::c_void);
+        fn CredWriteW(cred: *const CredentialW, flags: u32) -> i32;
+        fn CredDeleteW(target: *const u16, type_: u32, flags: u32) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// 读一条 Generic 凭据的密码（UTF-16LE 解码，与 python raw.decode('utf-16-le') 一致）。
+    pub fn read(target: &str) -> Option<String> {
+        let t = wide(target);
+        let mut ptr: *mut CredentialW = ptr::null_mut();
+        unsafe {
+            if CredReadW(t.as_ptr(), CRED_TYPE_GENERIC, 0, &mut ptr) == 0 || ptr.is_null() {
+                return None;
+            }
+            let c = &*ptr;
+            let out = if c.credential_blob.is_null() || c.credential_blob_size == 0 {
+                None
+            } else {
+                let bytes = std::slice::from_raw_parts(c.credential_blob, c.credential_blob_size as usize);
+                // UTF-16LE：两字节一码元；奇数字节截断（与 python 容错一致）
+                let units: Vec<u16> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+                String::from_utf16(&units).ok()
+            };
+            CredFree(ptr.cast());
+            out
+        }
+    }
+
+    /// 枚举所有以 suffix 结尾的凭据条目名（与 python _win_cred_targets 一致）。
+    pub fn targets(suffix: &str) -> Vec<String> {
+        let mut count: u32 = 0;
+        let mut arr: *mut *mut CredentialW = ptr::null_mut();
+        unsafe {
+            if CredEnumerateW(ptr::null(), 0, &mut count, &mut arr) == 0 || arr.is_null() {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            for i in 0..count as isize {
+                let c = &**arr.offset(i);
+                if c.target_name.is_null() { continue; }
+                let len = (0..).take_while(|&j| *c.target_name.offset(j) != 0).count();
+                let name = String::from_utf16_lossy(std::slice::from_raw_parts(c.target_name, len));
+                if name.ends_with(suffix) { out.push(name); }
+            }
+            CredFree(arr.cast());
+            out
+        }
+    }
+
+    /// 测试专用：写一条 Generic 凭据（blob 为 UTF-16LE 文本，与 python 客户端同口径）。
+    #[cfg(test)]
+    pub fn write_test(target: &str, text: &str) -> Result<(), String> {
+        let t = wide(target);
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+        let cred = CredentialW {
+            flags: 0, cred_type: CRED_TYPE_GENERIC, target_name: t.as_ptr(),
+            comment: ptr::null(), last_written: FileTime { dw_low: 0, dw_high: 0 },
+            credential_blob_size: bytes.len() as u32, credential_blob: bytes.as_ptr(),
+            persist: 2, attribute_count: 0, attributes: ptr::null(),
+            target_alias: ptr::null(), user_name: ptr::null(),
+        };
+        let ok = unsafe { CredWriteW(&cred, 0) };
+        if ok == 0 { return Err(format!("CredWriteW 失败：{}", std::io::Error::last_os_error())); }
+        Ok(())
+    }
+
+    /// 测试专用：删除一条凭据。
+    #[cfg(test)]
+    pub fn delete_test(target: &str) -> bool {
+        let t = wide(target);
+        unsafe { CredDeleteW(t.as_ptr(), CRED_TYPE_GENERIC, 0) != 0 }
+    }
+}
+
+#[cfg(not(windows))]
+mod wincred {
+    pub fn read(_target: &str) -> Option<String> { None }
+    pub fn targets(_suffix: &str) -> Vec<String> { Vec::new() }
+}
+
+/// 与 python os_key 对齐：解析指纹为 want 的 OS 凭据库密钥。
+/// 快路径从 credentials.json 真实路径派生条目名；慢路径枚举（捕获的登录把密文带到
+/// 临时/实例目录，而密钥仍在原路径下）。
+fn os_key(want: &str) -> Option<[u8; 32]> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(root) = current_root() {
+        let path = root.join("v2").join("credentials.json");
+        // realpath 与 abspath 两种形式（python os.path.realpath / abspath）
+        let real = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let real = crate::registry::strip_verbatim(&real);
+        let abs = crate::registry::strip_verbatim(&path);
+        let mut forms: Vec<String> = vec![real.to_string_lossy().to_string(), abs.to_string_lossy().to_string()];
+        forms.sort();
+        forms.dedup();
+        for form in forms {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(form.as_bytes());
+            let digest: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+            candidates.push(format!("{}{}", digest, KEYRING_SUFFIX));
+        }
+    }
+    for target in &candidates {
+        if let Some(text) = wincred::read(target) {
+            if let Some(k) = key_from_text(&text) {
+                if fingerprint(&k) == want { return Some(k); }
+            }
+        }
+    }
+    for target in wincred::targets(KEYRING_SUFFIX) {
+        if let Some(text) = wincred::read(&target) {
+            if let Some(k) = key_from_text(&text) {
+                if fingerprint(&k) == want { return Some(k); }
+            }
+        }
+    }
+    None
+}
+
+/// 与 python env_key 对齐：env 变量 → 声明的 secret 文件 → ROOT/v2/credential-secret。
+/// 每个候选文本 sha256 成密钥，指纹匹配才返回（绝不猜）。
+fn env_key(want: &str) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut texts: Vec<String> = Vec::new();
+    if let Ok(v) = std::env::var("ZCODE_CREDENTIAL_SECRET") { texts.push(v); }
+    if let Ok(declared) = std::env::var("ZCODE_CREDENTIAL_SECRET_FILE") {
+        if let Ok(t) = std::fs::read_to_string(&declared) { texts.push(t); }
+    }
+    if let Some(root) = current_root() {
+        if let Ok(t) = std::fs::read_to_string(root.join("v2").join("credential-secret")) { texts.push(t); }
+    }
+    for text in texts {
+        let n = text.len();
+        if !(32..=4096).contains(&n) { continue; }
+        let mut h = Sha256::new();
+        h.update(text.as_bytes());
+        let k: [u8; 32] = h.finalize().into();
+        if fingerprint(&k) == want { return Some(k); }
+    }
+    None
+}
 
 /// base64url 字母表（RFC 4648 §5，-_ 替代 +/）。
 const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -39,6 +264,17 @@ fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// 与 python key() 对齐：ZCODE_CREDENTIAL_SECRET 或 fallback 串 sha256。
+/// fallback 里的平台段必须用 python sys.platform 口径（win32/macos/linux），
+/// 不是 Rust std::env::consts::OS（windows/macos/linux）——否则无 env 密钥时
+/// Windows 上 v1 解密会与 python 不一致（golden 总设 env 密钥，曾掩盖此漂移）。
+fn py_platform() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "win32",
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
 fn key() -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let secret = std::env::var("ZCODE_CREDENTIAL_SECRET").unwrap_or_else(|_| {
@@ -46,23 +282,16 @@ fn key() -> [u8; 32] {
         let user = std::env::var("USERNAME")
             .or_else(|_| std::env::var("USER"))
             .unwrap_or_else(|_| "unknown".to_string());
-        format!("zcode-credential-fallback:{}:{}:{}", std::env::consts::OS, home.display(), user)
+        format!("zcode-credential-fallback:{}:{}:{}", py_platform(), home.display(), user)
     });
     let mut h = Sha256::new();
     h.update(secret.as_bytes());
     h.finalize().into()
 }
 
-/// 与 python decode 对齐：enc:v1: 前缀的 AES-GCM 解密；非该前缀原样返回。
-fn decode(value: &Value) -> Result<String, String> {
-    let s = match value {
-        Value::String(s) => s,
-        _ => return Err("ZCode credential values must be strings".into()),
-    };
-    if !s.starts_with("enc:v1:") {
-        return Ok(s.clone());
-    }
-    let parts: Vec<&str> = s[7..].split('.').collect();
+/// 与 python _open_envelope 对齐：iv.tag.ct 三段 base64url → AES-GCM 解密。
+fn open_envelope(body: &str, key: &[u8; 32]) -> Result<String, String> {
+    let parts: Vec<&str> = body.split('.').collect();
     if parts.len() != 3 {
         return Err("Invalid encrypted ZCode credential".into());
     }
@@ -74,8 +303,40 @@ fn decode(value: &Value) -> Result<String, String> {
     }
     let mut ct = data;
     ct.extend_from_slice(&tag);
-    let pt = crate::agentcrypt::aes_gcm_decrypt(&key(), &iv, &ct, &[])?;
+    let pt = crate::agentcrypt::aes_gcm_decrypt(key, &iv, &ct, &[])?;
     String::from_utf8(pt).map_err(|_| "ZCode credential reader failed".to_string())
+}
+
+/// 与 python decode 对齐：enc:v1（legacy 密钥）/ enc:v2（os/env 双源 + 指纹校验）。
+/// **未知信封绝不原样当明文返回**——那正是格式变更退化成"未登录"的根因（上游注释）。
+fn decode(value: &Value) -> Result<String, String> {
+    let s = match value {
+        Value::String(s) => s,
+        _ => return Err("ZCode credential values must be strings".into()),
+    };
+    if !s.starts_with("enc:") {
+        return Ok(s.clone());
+    }
+    if let Some(body) = s.strip_prefix("enc:v1:") {
+        return open_envelope(body, &key());
+    }
+    let Some(rest) = s.strip_prefix("enc:v2:") else {
+        return Err(format!("ZCode credential envelope is not recognised ({}…); the desktop app changed its cipher",
+            &s[..s.len().min(12)]));
+    };
+    // rest = source:want:body（body 内含 '.' 不含 ':'，splitn(3) 正确切分）
+    let mut it = rest.splitn(3, ':');
+    let source = it.next().unwrap_or("");
+    let want = it.next().unwrap_or("");
+    let body = it.next().unwrap_or("");
+    if (source != "os" && source != "env") || want.len() != 24 {
+        return Err("Invalid encrypted ZCode credential".into());
+    }
+    let k = if source == "os" { os_key(want) } else { env_key(want) };
+    let Some(k) = k else {
+        return Err(format!("ZCode system key unavailable ({}/{}); unlock the OS credential store and retry", source, want));
+    };
+    open_envelope(body, &k)
 }
 
 /// 与 python identity 对齐：派生 provider 级身份（不暴露明文 token）。
@@ -221,11 +482,15 @@ pub fn merge(current: &Value, target: Option<&Value>, selected_provider: Option<
 
 /// 与 python run 对齐：按 mode 分派。
 pub fn run(request: &Value) -> Result<Value, String> {
+    // 与 python run() 的 global ROOT 对齐：先按请求设数据根，decode/os_key/env_key 据此定位密钥环。
+    let root = request.get("root").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_root);
+    set_root(Some(root.clone()));
     let record = match request.get("record") {
         Some(r) if !r.is_null() => r.clone(),
         _ => {
-            let root = request.get("root").and_then(|v| v.as_str()).unwrap_or("");
-            let path = Path::new(root).join("v2").join("credentials.json");
+            let path = root.join("v2").join("credentials.json");
             if path.exists() {
                 let text = std::fs::read_to_string(&path).map_err(|_| "ZCode credential reader failed".to_string())?;
                 serde_json::from_str(&text).map_err(|_| "ZCode credential reader failed".to_string())?
@@ -387,5 +652,69 @@ mod tests {
             &std::fs::read_to_string(std::env::var("T18_ZCODE_PY").unwrap()).unwrap()).unwrap();
         let rs = run(&request).expect("Rust run 应成功");
         assert_eq!(rs, py, "zcode-auth 输出不一致：rust={} python={}", rs, py);
+    }
+
+    /// enc:v2 os-source：CredWriteW 写测试密钥环条目 → os_key 快路径解析 → AES-GCM 解密。
+    /// 验证 Windows 凭据库 FFI（UTF-16LE blob）+ sha256(realpath) 条目名 + 指纹校验全链路。
+    /// 用唯一测试条目名，测毕 CredDeleteW 清理，不碰真实 ZCode 凭据。
+    #[test]
+    #[cfg(windows)]
+    fn enc_v2_os_source_round_trip() {
+        use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+        // 32 字节合成密钥
+        let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(13));
+        let fp = fingerprint(&key);
+        // 临时 ROOT + credentials.json（os_key 快路径据其 realpath 派生条目名）
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("v2")).unwrap();
+        let cred_path = root.join("v2").join("credentials.json");
+        std::fs::write(&cred_path, b"{}").unwrap();
+        let real = cred_path.canonicalize().unwrap();
+        let real = crate::registry::strip_verbatim(&real);
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(real.to_string_lossy().as_bytes());
+        let digest: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+        let target = format!("{}{}", digest, KEYRING_SUFFIX);
+        // 密钥的 base64url 文本写入凭据库（UTF-16LE blob）
+        let key_text = b64url_encode(&key);
+        wincred::write_test(&target, &key_text).expect("写测试凭据");
+        // 加密一段明文
+        let cipher = Aes256Gcm::new((&key).into());
+        let nonce_bytes = [9u8; 12];
+        let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), b"bigmodel-os-source".as_ref()).unwrap();
+        let (data, tag) = ct.split_at(ct.len() - 16);
+        let envelope = format!("enc:v2:os:{}:{}.{}.{}", fp,
+            b64url_encode(&nonce_bytes), b64url_encode(tag), b64url_encode(data));
+        // 设 ROOT 后 decode 应经 os_key 快路径解析密钥并解密
+        set_root(Some(root));
+        let decoded = decode(&json!(envelope)).expect("os-source 解密应成功");
+        assert_eq!(decoded, "bigmodel-os-source");
+        // 清理测试凭据
+        let deleted = wincred::delete_test(&target);
+        assert!(deleted, "测试凭据应删除成功");
+        // 快路径条目已删 → read 应 None（不依赖全局枚举状态：其它会话/真实 ZCode
+        // 可能有同后缀条目，慢路径枚举属生产行为，不在本测试断言范围）。
+        assert!(wincred::read(&target).is_none(), "删除后快路径不应再读到测试密钥");
+        set_root(None);
+    }
+
+    /// enc:v2 未知信封绝不静默当明文（上游警告的退化根因）。
+    #[test]
+    fn unknown_envelope_errors_not_plaintext() {
+        let err = decode(&json!("enc:v9:whatever")).unwrap_err();
+        assert!(err.contains("not recognised"), "未知信封应报错而非返回明文：{err}");
+        // enc:v2 但 source 非法
+        let err2 = decode(&json!("enc:v2:bogus:0123456789abcdef01234567:aaa.bbb.ccc")).unwrap_err();
+        assert!(err2.contains("Invalid"), "非法 source 应报错：{err2}");
+    }
+
+    /// v1 fallback 平台口径：py_platform() 在 Windows 必须是 win32（与 python sys.platform 一致）。
+    #[test]
+    fn v1_fallback_platform_matches_python() {
+        if cfg!(windows) {
+            assert_eq!(py_platform(), "win32");
+        }
     }
 }

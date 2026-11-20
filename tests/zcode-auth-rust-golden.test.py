@@ -45,6 +45,30 @@ def make_record(provider, uid):
     }
 
 
+# enc:v2 env-source 合成密钥（独立于 v1，长度≥32 满足 env_key 门槛）
+V2_SECRET = "t18-golden-v2-env-secret-0123456789abcdef"
+V2_KEY = hashlib.sha256(V2_SECRET.encode("utf-8")).digest()
+V2_FP = hashlib.sha256(V2_KEY).hexdigest()[:24]
+
+
+def encrypt_v2_env(plaintext):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    iv = bytes(range(12))
+    ct = AESGCM(V2_KEY).encrypt(iv, plaintext.encode("utf-8"), None)
+    data, tag = ct[:-16], ct[-16:]
+    return f"enc:v2:env:{V2_FP}:" + ".".join([b64url(iv), b64url(tag), b64url(data)])
+
+
+def make_record_v2(provider, uid):
+    return {
+        "oauth:active_provider": encrypt_v2_env(provider),
+        f"oauth:{provider}:access_token": encrypt_v2_env("synthetic-v2-access-token"),
+        f"oauth:{provider}:user_info": encrypt_v2_env(json.dumps({"user_id": uid, "name": "V2Example", "email": "v2@example.com"})),
+        "zcodejwttoken": "",
+        "bot:private:credential": "keep-bot-v2",
+    }
+
+
 def main():
     spec = importlib.util.spec_from_file_location("z", ROOT / "src-tauri" / "scripts" / "zcode-auth.py")
     py = importlib.util.module_from_spec(spec)
@@ -65,6 +89,15 @@ def main():
     cases.append(("merge_logout", {"mode": "merge", "record": current, "provider": "zai"},
                   py.run({"mode": "merge", "record": current, "provider": "zai"})))
 
+    # enc:v2 env-source：独立 secret，python 与 Rust 都经 ZCODE_CREDENTIAL_SECRET 解析密钥
+    v2rec = make_record_v2("bigmodel", "v2u1")
+    os.environ["ZCODE_CREDENTIAL_SECRET"] = V2_SECRET
+    cases.append(("v2_identity", {"mode": "identity", "record": v2rec},
+                  py.run({"mode": "identity", "record": v2rec})))
+    cases.append(("v2_snapshot", {"mode": "snapshot", "record": v2rec},
+                  py.run({"mode": "snapshot", "record": v2rec})))
+    os.environ["ZCODE_CREDENTIAL_SECRET"] = SECRET
+
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="t18-zcode-golden-"))
     failures = 0
     for name, request, py_value in cases:
@@ -74,7 +107,7 @@ def main():
         py_path.write_text(json.dumps(py_value, ensure_ascii=False), encoding="utf-8")
         env = dict(os.environ)
         env["CARGO_TARGET_DIR"] = str(TARGET)
-        env["ZCODE_CREDENTIAL_SECRET"] = SECRET
+        env["ZCODE_CREDENTIAL_SECRET"] = V2_SECRET if name.startswith("v2_") else SECRET
         env["T18_ZCODE_REQ"] = str(req_path)
         env["T18_ZCODE_PY"] = str(py_path)
         p = subprocess.run(

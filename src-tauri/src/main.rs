@@ -52,6 +52,7 @@ mod proxy_ledger;
 mod qproxy;
 mod qwbridge;
 mod quota;
+mod quota_ledger;
 mod registry;
 mod remote;
 mod remote_tunnel;
@@ -178,6 +179,9 @@ fn main() {
             // 保管箱先解锁到内存（没设主密码就是 DPAPI 直接解），再把散落的明文收进去
             secrets::load();
             commands::sweep_plaintext();
+            // 官网取数入口删掉的产品（WorkBuddy），档案里残留的「去官网登录」提示
+            // 会指着一颗不存在的按钮，启动时清掉
+            webquota::sweep_stale_web_errors();
             if let Err(error) = zcode::migrate_registered() { lifecycle::note(&format!("ZCode 账号登记：{error}")); }
             // 开机先把「换号记录 vs 磁盘上的 junction」对一遍：两者脱节的后果不是显示错，
             // 是目标程序直接起不来（默认入口指着已删除的账号目录）。放在建托盘之前，
@@ -504,7 +508,7 @@ mod autofetch_tests {
         let seen = Arc::new(AtomicUsize::new(0));
         let s2 = seen.clone();
         let instances = vec![inst("a", ""), inst("b", "uid-b"), inst("c", "")];
-        run_local_quota_batch(&instances, move |_m, bound, _d, _uo| {
+        run_local_quota_batch("test", &instances, move |_m, bound, _d, _uo| {
             assert!(!bound.is_empty(), "未绑定账号不该进 worker");
             s2.fetch_add(1, Ordering::SeqCst);
         });
@@ -519,7 +523,7 @@ mod autofetch_tests {
         let processed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let p2 = processed.clone();
         let instances: Vec<Value> = (0..7).map(|i| inst(&format!("a{i}"), &format!("uid-{i}"))).collect();
-        run_local_quota_batch(&instances, move |m, _b, _d, uo| {
+        run_local_quota_batch("test", &instances, move |m, _b, _d, uo| {
             let name = m["name"].as_str().unwrap_or("").to_string();
             p2.lock().unwrap().push(name.clone());
             // 第一个账号判定 usage_only（全机共享累计数）
@@ -543,7 +547,7 @@ mod autofetch_tests {
         let peak = Arc::new(AtomicUsize::new(0));
         let (a2, p2) = (active.clone(), peak.clone());
         let instances: Vec<Value> = (0..9).map(|i| inst(&format!("a{i}"), &format!("uid-{i}"))).collect();
-        run_local_quota_batch(&instances, move |_m, _b, _d, _uo| {
+        run_local_quota_batch("test", &instances, move |_m, _b, _d, _uo| {
             let cur = a2.fetch_add(1, Ordering::SeqCst) + 1;
             p2.fetch_max(cur, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(30)); // 留出重叠窗口
@@ -559,7 +563,7 @@ mod autofetch_tests {
         let count = Arc::new(AtomicUsize::new(0));
         let c2 = count.clone();
         let instances: Vec<Value> = (0..5).map(|i| inst(&format!("a{i}"), &format!("uid-{i}"))).collect();
-        run_local_quota_batch(&instances, move |_m, _b, _d, _uo| {
+        run_local_quota_batch("test", &instances, move |_m, _b, _d, _uo| {
             c2.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(count.load(Ordering::SeqCst), 5, "5 个绑定账号应各处理一次");
@@ -623,6 +627,29 @@ fn checkin_loop(app: tauri::AppHandle) {
     }
 }
 
+fn auto_quota_bound(app_id: &str, meta: &serde_json::Value) -> String {
+    let bound = meta["quota_user_id"].as_str().unwrap_or("").trim();
+    if !bound.is_empty() { return bound.to_string(); }
+    // 旧版妙手解析漏了 data，覆盖掉绑定；已保存的数字会话格仍是原账号 ID。
+    // 只恢复这类旧官网档案，取回身份必须与这个 ID 相等后才允许写入。
+    let slot = meta["quota_web_slot"].as_str().unwrap_or("");
+    if app_id == "catpaw" && meta["quota_detail_source"] == "web"
+        && !slot.is_empty() && slot.bytes().all(|b| b.is_ascii_digit()) {
+        return slot.to_string();
+    }
+    String::new()
+}
+
+#[test]
+fn legacy_catpaw_binding_is_scoped_to_saved_numeric_web_slot() {
+    let old = serde_json::json!({"quota_detail_source":"web", "quota_web_slot":"12345"});
+    assert_eq!(auto_quota_bound("catpaw", &old), "12345");
+    assert_eq!(auto_quota_bound("qoder", &old), "");
+    assert_eq!(auto_quota_bound("catpaw", &serde_json::json!({"quota_web_slot":"12345"})), "");
+    assert_eq!(auto_quota_bound("catpaw", &serde_json::json!({"quota_detail_source":"web", "quota_web_slot":"account-name"})), "");
+    assert_eq!(auto_quota_bound("catpaw", &serde_json::json!({"quota_user_id":"67890", "quota_detail_source":"web", "quota_web_slot":"12345"})), "67890");
+}
+
 fn autofetch_once() {
     for app_def in registry::all_apps() {
         // 能本机直读的产品优先走本机：不联网、拿到的就是客户端里那个真数
@@ -636,9 +663,10 @@ fn autofetch_once() {
             // T5：先批量预取「标准直读」账号（一次进程冷启），结果按 data_dir 缓存；
             // autofetch_local_account 优先用缓存，未命中/批量失败回退逐账号 fetch_for_account。
             // zcode/workbuddy/trae 等回落或特殊路径不进批量（守卫/登录包逻辑在单账号路）。
-            let prefetch = prefetch_local_quotas(&store, &instances);
+            let prefetch = prefetch_local_quotas(&app_id, &store, &instances);
             let prefetch = std::sync::Arc::new(prefetch);
-            run_local_quota_batch(&instances, move |meta, bound, data_dir, uo| {
+            let batch_app_id = app_id.clone();
+            run_local_quota_batch(&batch_app_id, &instances, move |meta, bound, data_dir, uo| {
                 autofetch_local_account(&app_id, &store, meta, bound, data_dir, uo, &prefetch);
             });
             continue;
@@ -716,7 +744,7 @@ fn now_ts() -> f64 {
 /// - 未绑定（quota_user_id 空）的账号不提交（首次绑定必须用户手动点）；
 /// - usage_only 共享标志一旦置位，后续账号全部跳过（等价原串行 break：全机共享累计数不灌进每个档案）。
 /// `fetch` 闭包接收 (meta, bound, data_dir, usage_only标志)，在 worker 线程里执行取数+校验+写回。
-fn run_local_quota_batch<F>(instances: &[Value], fetch: F)
+fn run_local_quota_batch<F>(app_id: &str, instances: &[Value], fetch: F)
 where
     F: Fn(&Value, &str, &str, &AtomicBool) + Send + Sync + 'static,
 {
@@ -726,7 +754,9 @@ where
     for chunk in instances.chunks(3) {
         for meta in chunk {
             let data_dir = meta["data_dir"].as_str().unwrap_or("").to_string();
-            let bound = meta["quota_user_id"].as_str().unwrap_or("").trim().to_string();
+            // 上游 v2.6.0：auto_quota_bound 恢复旧版妙手解析漏 data 覆盖掉的绑定
+            // （已保存的数字会话格仍是原账号 ID）。与串行版同口径。
+            let bound = auto_quota_bound(app_id, meta);
             if bound.is_empty() {
                 continue;
             }
@@ -756,6 +786,7 @@ where
 /// 批量整轮失败 → 返回空缓存，autofetch_local_account 全部回退逐账号 fetch_for_account（T12 并发仍在）。
 /// 返回 HashMap<data_dir, Option<Quota>>：Some=批量取到，None=该账号批量失败（回退单账号重试）。
 fn prefetch_local_quotas(
+    app_id: &str,
     store: &str,
     instances: &[Value],
 ) -> std::collections::HashMap<String, Option<local_quota::Quota>> {
@@ -764,7 +795,7 @@ fn prefetch_local_quotas(
     let mut targets: Vec<(String, Option<String>)> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
     for meta in instances {
-        let bound = meta["quota_user_id"].as_str().unwrap_or("").trim();
+        let bound = auto_quota_bound(app_id, meta);
         if bound.is_empty() {
             continue;
         }

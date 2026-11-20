@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agent 驾驶舱</title>
 <link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="home-agent-sort.css">
 <link rel="stylesheet" href="usage-dashboard.css">
 <link rel="stylesheet" href="settings-ui.css">
 <link rel="stylesheet" href="client-connect.css">
@@ -144,6 +145,7 @@
         <button class="btn" id="btn-reload" title="立即刷新账号与进程状态">刷新</button>
       </div>
       <div class="pagebody">
+      <section class="panel" id="claude-runtime" aria-label="Claude 运行环境" hidden></section>
       <div class="hintline" id="cur-hint" hidden></div>
       <div class="cards" id="cards"></div>
 
@@ -209,6 +211,7 @@
         <button class="btn primary" id="btn-key-new">＋ 添加站点</button>
         <button class="btn" id="btn-keys-expiring" title="只看 30 天内过期的">只看临期</button>
         <button class="btn" id="btn-keys-dedup" title="按密钥原文找出重复登记的条目，保留一条删其余">查重</button>
+        <button class="btn" id="btn-keys-edit" title="勾选任意多条密钥，一次统一改名称、来源、截止日期、备注、接入点与是否进反代">批量编辑</button>
         <button class="btn" id="btn-keys-batch" title="勾选任意多条密钥一次删除">批量删除</button>
       </div>
       <div class="pagebody">
@@ -228,6 +231,20 @@
                   <span class="kv" id="k-intake-info">先按本机规则读，认不出才交给多模态模型（设置 → AI 识别）</span>
                 </div>
               </div>
+            </div>
+            <div class="panel keyfind" id="key-find">
+              <h2>找密钥<span class="ihelp" data-tip="手上有一把 key，不知道属于哪家、也没记下来保存过没有？把它贴进来，这里会告诉你在台账的哪个站点、哪一条里。">?</span></h2>
+              <div class="pasteline">
+                <label for="k-find-q">粘贴要找的 key（完整原文、看到的打码形式，或只记得头尾片段都行）</label>
+                <div class="ctlrow" style="margin-top:8px">
+                  <input id="k-find-q" class="grow mono" spellcheck="false" autocomplete="off"
+                    placeholder="例：sk-abc123••••wxyz　或只记得尾巴 4 位">
+                  <button class="btn primary sm" id="k-find-go">查找</button>
+                  <button class="btn sm" id="k-find-clear">清空</button>
+                </div>
+                <div class="kv" id="k-find-info">不会把 key 发到任何地方，只在本机台账里比对</div>
+              </div>
+              <div id="k-find-out"></div>
             </div>
             <div id="keysites" class="keysites"></div>
           </div>
@@ -444,6 +461,38 @@
   </div>
 </div>
 
+<!-- ================= 接入点体检弹窗 =================
+     一张矩阵：行是密钥、列是协议。两种入口都进这张表——
+     从接入点行进来高亮那一列，从密钥行进来高亮那一行。
+     单说「可用 / 不可用」分不清是密钥的事还是协议的事，摊开才看得明白。 -->
+<div class="modal" id="mxmodal" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true">
+    <h3 id="mx-title">接入点体检</h3>
+    <p class="askbody" id="mx-sub"></p>
+    <div class="mxwrap">
+      <table class="mx">
+        <thead id="mx-head"></thead>
+        <tbody id="mx-body"></tbody>
+      </table>
+    </div>
+    <div class="mxlegend">
+      <span class="mxst ok"><span class="dot"></span>连通</span>
+      <span class="mxst key_denied"><span class="dot"></span>密钥无权</span>
+      <span class="mxst site_disabled"><span class="dot"></span>站点停用该协议</span>
+      <span class="mxst model_mismatch"><span class="dot"></span>模型不识别</span>
+      <span class="mxst unt"><span class="dot"></span>未检测</span>
+    </div>
+    <p class="mxhint">
+      点单元格复检单项；表头「检测本列」检测该协议下的全部密钥；行尾「检测本行」检测该密钥的全部协议。
+      「站点停用该协议」不是密钥的问题——换一列看。
+    </p>
+    <footer class="dialogfoot">
+      <button class="btn" id="mx-close">关闭</button>
+      <button class="btn primary" id="mx-all">检测全表</button>
+    </footer>
+  </div>
+</div>
+
 <!-- ================= key 编辑弹窗 =================
      这条 key 自己的东西：名称、来源、Key 原文、截止日期、备注；
      接入点默认归站点（「修改站点」里那几行），这里多一格只在
@@ -549,6 +598,24 @@
   </div>
 </div>
 
+<!-- ================= API 台账：key 批量编辑 =================
+     和「批量删除」同一套勾选方式，区别只在最后一步：不是整条清掉，
+     而是把勾上的那几项统一改掉。没勾的项一律不动。 -->
+<div class="modal blur" id="bemodal" hidden>
+  <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="be-title">
+    <h3 id="be-title">批量编辑密钥</h3>
+    <div class="hintline" id="be-sub">上面勾要改哪些密钥，下面勾要统一改哪几项；没勾的项一律不动，密钥原文不会被改。</div>
+    <div class="bdlist" id="be-list"></div>
+    <div class="beform" id="be-form"></div>
+    <footer class="dialogfoot">
+      <span class="kv" id="be-count"></span>
+      <span class="sp"></span>
+      <button class="btn" id="be-cancel">取消</button>
+      <button class="btn primary" id="be-go">应用</button>
+    </footer>
+  </div>
+</div>
+
 <!-- ================= API 台账：key 查重 / 批量删除 ================= -->
 <div class="modal blur" id="bdmodal" hidden>
   <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="bd-title">
@@ -638,6 +705,7 @@
 
 <div class="toasts" id="toast" aria-live="polite"></div>
 
+<script src="instance-presentation.js"></script>
 <script src="chatgpt.js"></script>
 <script src="zcode.js"></script>
 <script src="antigravity.js"></script>
@@ -650,6 +718,7 @@
 <script src="client-connect.js"></script>
 <script src="gateway-routes.js"></script>
 <script src="app.js"></script>
+<script src="home-agent-sort.js"></script>
 <script src="remote-online.js"></script>
 <script src="proxy-guide.js"></script>
 </body>

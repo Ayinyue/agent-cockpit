@@ -42,7 +42,15 @@ class AgenthubBundleTests(unittest.TestCase):
 
     def test_bundled_agenthub_has_no_plaintext_cookie_cache(self):
         source = (VENDOR / "agenthub.py").read_text(encoding="utf-8")
-        self.assertNotIn("DOUBAO_CACHE", source)
+        # 上游 v2.6.0 新增豆包凭据兜底缓存 DOUBAO_CACHE，但**必须 DPAPI 加密**
+        # （_dpapi_protect 写、_dpapi 读，.dpapi 后缀）——豆包常驻锁住 Cookies 库时
+        # 反代/签到仍有凭据可用。安全意图是「不落明文 cookie」，不是「不许有缓存变量」：
+        # 断言缓存写入必经 _dpapi_protect，且无任何明文 cookie 落盘路径。
+        if "DOUBAO_CACHE" in source:
+            self.assertIn("DOUBAO_CACHE.write_bytes(_dpapi_protect(", source,
+                          "豆包凭据缓存必须 DPAPI 加密落盘，不得明文")
+            self.assertNotIn("DOUBAO_CACHE.write_text(", source,
+                             "豆包凭据缓存不得以明文文本落盘")
         self.assertNotIn('WORKBUDDY_AT_REST_SECRET_KEY = "', source)
 
     def test_workbuddy_runtime_key_recovery_is_local_and_verified(self):
