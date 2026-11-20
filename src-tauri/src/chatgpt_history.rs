@@ -32,6 +32,12 @@ fn run_shared(homes:Vec<PathBuf>,busy:Vec<PathBuf>)->Result<Value,String>{
 }
 
 fn run_script(request:Value)->Result<Value,String>{
+    // T18 第三批：repair_projects mode 已迁 Rust（chatgpt_history_repair::run，golden 钉住
+    // 与 python 逐字段一致）。原生路径免 python 冷启；失败回退 python。
+    // copy_history / shared-history / sync 仍走 python（数据丢失级，未迁）。
+    if request.get("mode").and_then(|v|v.as_str())==Some("repair_projects"){
+        if let Ok(v)=crate::chatgpt_history_repair::run(&request){return Ok(v);}
+    }
     run_python(include_str!("../scripts/chatgpt-history.py"), request)
 }
 

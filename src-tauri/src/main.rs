@@ -64,6 +64,7 @@ mod state;
 mod storage;
 mod swap;
 mod traeproxy;
+mod chatgpt_history_repair;
 mod trae_clean;
 mod zcode_auth;
 mod usage;

@@ -50,7 +50,7 @@ hmac = "0.12"
 sha2 = "0.10"
 # T17（usage-local 迁 Rust）：按文件指纹增量缓存的存储层。bundled 自带 SQLite C 源码
 # 静态编译，不依赖系统 sqlite3.dll；计划 §4.4.2 明确要求「借迁移换 SQLite 只重算变化条目」。
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # T17 第三阶段：dsh 会话日志是 zstd 压缩（session.v4.jsonl.zstd）。纯 Rust 解码，
 # 与 python zstandard 同口径；只读解压，不接任何生产压缩路径。
 zstd = "0.13"
