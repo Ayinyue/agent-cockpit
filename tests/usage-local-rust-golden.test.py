@@ -174,7 +174,7 @@ def golden_case(py, app, profile, lines, rel_path, test_name, env_prefix):
 
 
 def real_sample(py, app, root, light):
-    """真实数据全量比对：python collect vs Rust collect_messages（同一真实目录，只读）。"""
+    """真实数据全量比对：python collect vs Rust collect（同一真实目录，只读）。"""
     with_records = not light
     py_result = py.collect(app, str(root), None, with_records=with_records)
     if py_result is None:
@@ -183,11 +183,16 @@ def real_sample(py, app, root, light):
     tmp = pathlib.Path(tempfile.mkdtemp(prefix=f"t17-real-{app}-"))
     py_path = tmp / "py_result.json"
     py_path.write_text(json.dumps(py_result, ensure_ascii=False), encoding="utf-8")
-    rc = run_rust_golden("usage_local::tests::golden_messages_matches_python", {
-        "T17M_GOLDEN_FIXTURE": str(root),
-        "T17M_GOLDEN_PY_RESULT": str(py_path),
-        "T17M_GOLDEN_APP": app,
-    }, timeout=1200)
+    other_apps = {"zcode", "opencode", "marvis", "astudio", "dsh", "gemini", "gemini-cli"}
+    if app in other_apps:
+        test_name = "usage_local::tests::golden_other_matches_python"
+        env_extra = {"T17O_GOLDEN_FIXTURE": str(root), "T17O_GOLDEN_PY_RESULT": str(py_path),
+                     "T17O_GOLDEN_APP": app}
+    else:
+        test_name = "usage_local::tests::golden_messages_matches_python"
+        env_extra = {"T17M_GOLDEN_FIXTURE": str(root), "T17M_GOLDEN_PY_RESULT": str(py_path),
+                     "T17M_GOLDEN_APP": app}
+    rc = run_rust_golden(test_name, env_extra, timeout=1200)
     print(f"[real:{app}] files={py_result['files']} total={py_result['total']} "
           f"sessions={py_result['sessions']} light={light} cargo_exit={rc}")
     return rc
@@ -224,7 +229,9 @@ def main():
                    "qoder-cn": ".qoder-cn", "qoderwork": ".qoderwork", "qwenwork": ".qwenwork",
                    "qwenworkcn": ".qwenworkcn", "workbuddy": ".workbuddy",
                    "workbuddy-intl": ".workbuddy-intl", "codebuddy": ".codebuddy",
-                   "codebuddy-cn": ".codebuddy-cn", "minimax": ".minimax"}
+                   "codebuddy-cn": ".codebuddy-cn", "minimax": ".minimax",
+                   "zcode": ".zcode", "opencode": ".opencode", "marvis": ".marvis",
+                   "astudio": ".astudio", "dsh": ".dsh", "gemini": ".gemini", "gemini-cli": ".gemini"}
         for app in [a.strip() for a in real_apps.split(",") if a.strip()]:
             root = home / dir_map.get(app, "." + app)
             if not root.is_dir():

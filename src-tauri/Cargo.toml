@@ -51,6 +51,9 @@ sha2 = "0.10"
 # T17（usage-local 迁 Rust）：按文件指纹增量缓存的存储层。bundled 自带 SQLite C 源码
 # 静态编译，不依赖系统 sqlite3.dll；计划 §4.4.2 明确要求「借迁移换 SQLite 只重算变化条目」。
 rusqlite = { version = "0.32", features = ["bundled"] }
+# T17 第三阶段：dsh 会话日志是 zstd 压缩（session.v4.jsonl.zstd）。纯 Rust 解码，
+# 与 python zstandard 同口径；只读解压，不接任何生产压缩路径。
+zstd = "0.13"
 
 # 官网逐资源包额度要驾驶舱自己开窗口登录，登录后从那个 WebView2 的 cookie 罐里取会话
 # （见 webquota.rs）。版本必须和 tauri/wry 用的那条链一致，否则 ICoreWebView2* 类型对不上。
