@@ -77,13 +77,20 @@ fn collect_inner(app_id: &str, data_dir: &str, with_records: bool) -> CollectRes
     let path = path.canonicalize().map_err(|_| "无法解析本地用量目录。".to_string())?;
     let key = format!("{}|{}|{}", app_id, path.to_string_lossy().to_lowercase(), with_records);
     cached_source(key, || {
-        // T17 第一阶段：codex/chatgpt 走 Rust 原生解析 + SQLite 增量缓存（免 python 冷启
-        // 与整包 json.loads/dumps）。失败回退 python 路径——迁移期两条路互为保底，
-        // golden 测试钉住数字一致（tests/usage-local-rust-golden.test.py）。
-        // 其余产品（claude/messages、各 DB）仍走 python，后续批次迁移。
-        if app_id == "codex" || app_id == "chatgpt" {
+        // T17：codex/chatgpt（第一阶段）与 messages 系（第二阶段）走 Rust 原生解析 +
+        // SQLite 增量缓存（免 python 冷启与整包 json.loads/dumps）。失败回退 python
+        // 路径——迁移期两条路互为保底，golden 测试钉住数字一致
+        // （tests/usage-local-rust-golden.test.py）。DB 系/dsh/gemini 仍 python（第三阶段）。
+        let rust_supported = app_id == "codex" || app_id == "chatgpt"
+            || crate::usage_local::is_messages_app(app_id);
+        if rust_supported {
             let cache_dir = crate::registry::base_dir().join("usage-cache-rust");
-            match crate::usage_local::collect_codex(app_id, &path, Some(&cache_dir), with_records) {
+            let outcome = if app_id == "codex" || app_id == "chatgpt" {
+                crate::usage_local::collect_codex(app_id, &path, Some(&cache_dir), with_records)
+            } else {
+                crate::usage_local::collect_messages(app_id, &path, Some(&cache_dir), with_records)
+            };
+            match outcome {
                 Ok(v) => return Ok(v),
                 Err(_) => { /* 回退 python */ }
             }
