@@ -54,6 +54,9 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # T17 第三阶段：dsh 会话日志是 zstd 压缩（session.v4.jsonl.zstd）。纯 Rust 解码，
 # 与 python zstandard 同口径；只读解压，不接任何生产压缩路径。
 zstd = "0.13"
+# T18 第五批（copy_history 迁 Rust）：rollout 压缩档案含 .jsonl.gz，python 用 gzip.open。
+# 纯 Rust miniz_oxide 后端，只读解压；与 zstd 同纪律，不接生产压缩路径。
+flate2 = "1"
 
 # 官网逐资源包额度要驾驶舱自己开窗口登录，登录后从那个 WebView2 的 cookie 罐里取会话
 # （见 webquota.rs）。版本必须和 tauri/wry 用的那条链一致，否则 ICoreWebView2* 类型对不上。
