@@ -285,10 +285,10 @@
   **T19 部分迁①cmd_stop 去 PowerShell / ②728 行 PAGE 挪静态资源** 已于 11-20 完成并提交（长驻服务主体按评估「留」不迁）。
   **T18 第四批 sync 增量复制 + shared 侧栏目录重建热路径** 已于 11-21 完成并提交 **e3c58ad**（Rust 优先 + python 幂等回退，两套 golden + 变异探针，全量 512 过，**fork CI run #7 全绿**）。
   **T18 第五批 copy_history 全量迁 Rust** 已于 11-21 完成并提交 **cca9e4d**（Rust 优先 + python 幂等回退，golden + 4 单测 + 2 变异探针，全量 517 过）。
-  **T18 第六批 shared migrate 管理全量迁 Rust（T18 收官）** 已于 11-21 完成（junction/整库对账/WAL 退役/备份回滚，
-  Rust 优先 + python 幂等回退，4 场景 golden 含备份 gz 解压库内容比对 + 2 单测 + 2 变异探针，全量 520 过，**未提交待授权**）。
+  **T18 第六批 shared migrate 管理全量迁 Rust（T18 收官）** 已于 11-21 完成并提交 **0fc53db**（junction/整库对账/WAL 退役/备份回滚，
+  Rust 优先 + python 幂等回退，4 场景 golden 含备份 gz 解压库内容比对 + 2 单测 + 2 变异探针，全量 520 过，**fork CI run#10 全绿**）。
   真实登录态样本缺口如实标注：全部验证基于合成 fixture；生产切换后首轮真实账号迁移建议人工盯 status.json 的 pending/migrated。
-  **CI 编译工作流**已于 11-20/21 建成并全绿（run #3，见上表）；浏览器套件与真机抽样有意不在 CI 内。）
+  **CI 编译工作流**已于 11-20/21 建成并全绿（run #3，见上表），11-22 起全门禁通过后自动发布 prerelease（v2.6.0-build.<run#>）；浏览器套件与真机抽样有意不在 CI 内。）
 
 - **上游分叉已整合（2026-11-21，用户决策「整合上游·含 enc:v2 迁 Rust」）**：merge origin/main（v2.6.0 积分台账/密钥体检/站点级取模型 + agentfind 脚本合一），
   合并提交 **4f0737a**（58 文件 +9913/−683），**fork CI run #5 全绿**。冲突按「上游功能为准、迁移层重新适配」解：
