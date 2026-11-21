@@ -199,7 +199,10 @@ def main():
     hist = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(hist)
 
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="t18-copy-golden-"))
+    # CI runner TEMP 含 8.3 短名（RUNNER~1）：fixture 必须先 resolve 再写库内
+    # rollout_path，与生产 copy_history 先 resolve 的口径一致（同 run#1/#2 修法）。
+    # 本机长名环境下 resolve 为恒等变换，行为不变。
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="t18-copy-golden-")).resolve()
     py_base = tmp / "py"; rs_base = tmp / "rs"
     zst1 = build_source(py_base / "source"); build_target(py_base / "target")
     zst2 = build_source(rs_base / "source"); build_target(rs_base / "target")
