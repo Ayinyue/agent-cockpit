@@ -175,7 +175,7 @@ jobs:
       # golden 驱动进程用 vendored python（带 cryptography）；Rust 侧 cargo 子进程由脚本自起，
       # 经 junction 命中同一 target（指纹一致，见设计注 1）。
       # license-report 本机沙箱的 tempfile 清理拦截（CHAT_REFERENCE_PROTECTED）在 CI 不存在，应全绿。
-      - name: Cross-language golden (crypto / DPAPI / usage / zcode / trae / history-repair / history-sync / history-rebuild)
+      - name: Cross-language golden (crypto / DPAPI / usage / zcode / trae / history-repair / history-sync / history-rebuild / history-copy)
         run: |
           $py = Join-Path $env:USERPROFILE ".agent-cockpit\usage-runtime\python-3.14.10-ci\python.exe"
           $goldens = @(
@@ -186,7 +186,8 @@ jobs:
             'tests/trae-clean-rust-golden.test.py',
             'tests/chatgpt-history-repair-rust-golden.test.py',
             'tests/chatgpt-history-sync-rust-golden.test.py',
-            'tests/chatgpt-history-rebuild-rust-golden.test.py'
+            'tests/chatgpt-history-rebuild-rust-golden.test.py',
+            'tests/chatgpt-history-copy-rust-golden.test.py'
           )
           $failed = @()
           foreach ($t in $goldens) {

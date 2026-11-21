@@ -52,6 +52,7 @@ dependencies = [
  "cbc",
  "chrono",
  "cipher",
+ "flate2",
  "hmac",
  "image",
  "indexmap 1.9.3",

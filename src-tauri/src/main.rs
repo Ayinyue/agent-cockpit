@@ -67,6 +67,7 @@ mod swap;
 mod traeproxy;
 mod chatgpt_history_repair;
 mod chatgpt_history_sync;
+mod chatgpt_history_copy;
 mod trae_clean;
 mod zcode_auth;
 mod usage;
