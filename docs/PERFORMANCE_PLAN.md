@@ -258,6 +258,8 @@
 
 | **CI 发布 Release**（2026-11-22，用户「ci加一个编译完成发布release版本」） | ci.yml 新增独立 `publish-release` job：`needs: build-and-test`（任何门禁红都不发布）+ `if: github.event_name != pull_request`（PR 永不发布）+ job 级 `contents: write`（顶层保持 read）。下载已过隐私门的 exe 产物 → zip + SHA256SUMS.txt → `gh release create v<Cargo版本>-build.<run_number> --prerelease`（每轮不可变 tag，不覆盖既有 Release、不冒充正式版；同 run 重跑幂等刷新资产）。正文带 commit/run 链接与门禁清单。YAML 解析 + 两段 bash -n + 打包/版本号提取/sha256 本机 dry-run 验证 | **已提交 2413ec0，fork CI run#12 全绿并实际发布首个 Release：[v2.6.0-build.12](https://github.com/Ayinyue/agent-cockpit/releases/tag/v2.6.0-build.12)**（Pre-release）。publish-release 5 步全 success（下载 1s/打包 3s/发布 5s）。资产：exe 36.4MB + zip 23.5MB + SHA256SUMS.txt。**端到端校验**：下载 zip sha256 与清单一致（007a7a5f…），解包 exe sha256 与清单一致（5bdb75de…），PE 头有效。run#11（f1517e7 docs）在旧 workflow 下运行无发布 job，属预期 |
 
+| **T15 切生产**（2026-11-22，用户「按建议执行」） | `secrets.rs` 生产四原语去 PowerShell：**protect/unprotect** 原生 CryptProtectData/CryptUnprotectData 优先（dpapi_native，CurrentUser+UI_FORBIDDEN 同口径），失败回退 PS 再试（两通道任一成功即可，都失败返回 PS 错误与旧版口径相同，load() 据此保持锁定）；**derive** 进程内 PBKDF2-HMAC-SHA512（agentcrypt，.NET Rfc2898 字符串密码同按 UTF-8 取字节）；**random_b64** BCryptGenRandom（与 antigravity/remote 生产同款 CSPRNG，失败回退 PS，绝不退可预测随机）。PS 通道保留为回退不删。新增 cfg(test) PS_DISABLED_FOR_TEST 开关+串行锁 | **真实 vault 只读双通道探针**（tests/t15-real-vault-readonly-probe.py）：本机真实 vault（3 凭据，无主密码）PS 解 vs 原生解 sha256 逐字节一致（022eb6fb…，14699 字节），明文 JSON 结构与 count 相符；原生 Protect→PS Unprotect 写路径互操作一致；vault 零写入。**跨语言 golden**（tests/t15-secrets-golden.test.py，双向）：A Rust 生产 protect（含/无 entropy）→PS 解一致 + derive 1000/150000 轮 vs .NET Rfc2898 逐字节一致 + random 32 字节两次不同；B PS 密文→Rust 生产 unprotect 一致 + 错 entropy 拒绝。**3 条变异红**：原生 unprotect 丢 entropy（独立性测试红——功能 golden 因 PS 回退兜底抓不到，故补「禁 PS 原生独立完成」测试）/ derive 字节篡改（golden A3 红）/ 还原零残留。secrets 6 单测绿；全量 **556 项 = 522 过 / 0 失败 / 34 忽略**（554→556 +2）。privacy 0。CI golden 登记至 **11 套**。**未提交**（待用户授权） |
+
 **顺带修掉的 4 套既有测试缺陷**（都不是本轮引入，在 Chrome 上同样会红）：
 - `add-app-picker` / `external-checkin` / `checkin-pending-day` / `workbuddy-accounts`：未屏蔽新手引导，
   `.tourmask` 600ms 后拦截点击 —— 此前靠「抢在引导出现前点完」的时序运气偶尔通过。
@@ -278,7 +280,8 @@
 ### 未执行（明确留待后续，不在本轮声称完成）
 
 - **阶段四 T16/T20**（agentcrypt 接生产 / agenthub 瘦身）：**数据丢失级风险**，须真实登录态样本 + 单独授权。
-  T14 加密原语 + T15 原生 DPAPI 地基已建（见上表），但**未接任何生产加解密路径**；PowerShell 与 Python 冷启开销本轮**不会消失**。
+  T14 加密原语已建；**T15 已于 11-22 切生产**（保管箱四原语原生优先+PS 回退，真实 vault 双通道验证，见上表）——
+  保管箱路径的 PowerShell 冷启开销已消除（回退保留）；agenthub 的 Python 冷启开销仍在（T16/T20 范畴）。
   T16 需改 vendored agenthub.py（触「不整体重写 agenthub」红线）。
   （T1/T6/T9/T11/T7/T12/T14地基/T15地基/T5集成/T19评估 已于 2026-11-19 完成；**T17 第一/二/三阶段**已于 11-19/11-20 完成并提交，
   usage-local.py 全部产品 Rust 解析完成，python 仅作回退保底。**T18 第一批 trae-gateway-clean / 第二批 zcode-auth / 第三批 chatgpt-history 项目修复** 已于 11-20 完成并提交。

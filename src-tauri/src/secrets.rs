@@ -25,6 +25,11 @@ static ENTROPY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// T15：测试专用开关——置 true 时 run_ps 直接报错，证明原生路径独立完成
+/// （不依赖 PowerShell 回退）。生产恒 false；仅 cfg(test) 下可置位。
+#[cfg(test)]
+static PS_DISABLED_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
 pub fn file() -> PathBuf {
     base_dir().join("vault.json")
 }
@@ -41,6 +46,10 @@ pub fn supported() -> bool {
 fn run_ps(script: &str, envs: &[(&str, &str)]) -> Result<String, String> {
     if !supported() {
         return Err("这台机器不是 Windows，没有 DPAPI".into());
+    }
+    #[cfg(test)]
+    if PS_DISABLED_FOR_TEST.load(Ordering::SeqCst) {
+        return Err("T15 测试：PowerShell 通道已禁用".into());
     }
     // -EncodedCommand 要的是 UTF-16LE 的 base64：绕开控制台代码页，脚本里的引号也不会被吞
     let utf16: Vec<u8> = script
@@ -154,6 +163,12 @@ $r.GetBytes($b)
 "#;
 
 fn protect(plain: &[u8], entropy: &[u8]) -> Result<String, String> {
+    // T15 切生产：原生 CryptProtectData 优先（进程内，免起 PowerShell）；
+    // 失败回退 PowerShell 通道（同口径 CurrentUser，golden+真实 vault 双通道已验证互解一致）。
+    #[cfg(windows)]
+    if let Ok(blob) = crate::dpapi_native::protect(plain, entropy) {
+        return Ok(b64_encode(&blob));
+    }
     let e = if entropy.is_empty() {
         String::new()
     } else {
@@ -166,6 +181,15 @@ fn protect(plain: &[u8], entropy: &[u8]) -> Result<String, String> {
 }
 
 fn unprotect(blob: &str, entropy: &[u8]) -> Result<Vec<u8>, String> {
+    // T15 切生产：原生 CryptUnprotectData 优先。失败（含错 entropy/换机器）回退
+    // PowerShell 再试一次——两通道任一成功即可，语义与旧版完全一致；
+    // 都失败时返回 PowerShell 的错误（与旧版报错口径相同，load() 据此保持锁定）。
+    #[cfg(windows)]
+    if let Ok(raw) = b64_decode(blob) {
+        if let Ok(plain) = crate::dpapi_native::unprotect(&raw, entropy) {
+            return Ok(plain);
+        }
+    }
     let e = if entropy.is_empty() {
         String::new()
     } else {
@@ -185,6 +209,14 @@ pub fn dpapi_open(b64: &str) -> Result<Vec<u8>, String> {
 }
 
 fn derive(pwd: &str, salt_b64: &str, rounds: i64) -> Result<Vec<u8>, String> {
+    // T15 切生产：进程内 PBKDF2-HMAC-SHA512（agentcrypt，golden 已钉与标准实现逐字节一致；
+    // .NET Rfc2898DeriveBytes 对字符串密码同样按 UTF-8 取字节，口径一致）。
+    // rounds 超界/盐解码失败回退 PowerShell（错误语义与旧版相同）。
+    if let (Ok(salt), Ok(n)) = (b64_decode(salt_b64), u32::try_from(rounds)) {
+        if n > 0 {
+            return Ok(crate::agentcrypt::pbkdf2_sha512(pwd.as_bytes(), &salt, n, 32));
+        }
+    }
     let out = run_ps(
         PS_DERIVE,
         &[
@@ -197,6 +229,20 @@ fn derive(pwd: &str, salt_b64: &str, rounds: i64) -> Result<Vec<u8>, String> {
 }
 
 fn random_b64() -> Result<String, String> {
+    // T15 切生产：BCryptGenRandom（系统首选 CSPRNG，与 antigravity/remote 生产同款）
+    // 优先；失败回退 PowerShell RNGCryptoServiceProvider。绝不退回可预测随机数。
+    #[cfg(windows)]
+    {
+        let mut bytes = [0u8; 32];
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(algorithm: *mut std::ffi::c_void, buffer: *mut u8, len: u32, flags: u32) -> i32;
+        }
+        let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), 32, 2) };
+        if status >= 0 {
+            return Ok(b64_encode(&bytes));
+        }
+    }
     run_ps(PS_RANDOM, &[])
 }
 
@@ -653,6 +699,93 @@ mod tests {
         assert_eq!(a, b, "同盐同密码要出同一把钥匙");
         assert_eq!(a.len(), 32);
         assert_ne!(a, c, "差一个字符就该完全不同");
+    }
+
+    // ---------------- T15 切生产：golden 桥（由 tests/t15-secrets-golden.test.py 触发） ----------------
+    // emit：走生产 protect/derive/random_b64（原生优先路径）产出向量供 PowerShell 验证；
+    // verify：走生产 unprotect 解 PowerShell 密文（含错 entropy 必须拒绝）。
+    #[test]
+    fn t15_golden_bridge() {
+        if !supported() {
+            return;
+        }
+        let Ok(req_path) = std::env::var("T15_SECRETS_REQ") else {
+            eprintln!("跳过 golden：未设 T15_SECRETS_REQ");
+            return;
+        };
+        let req: Value = serde_json::from_str(&fs::read_to_string(&req_path).unwrap()).unwrap();
+        let out_path = req["out"].as_str().unwrap();
+        match req["mode"].as_str().unwrap() {
+            "emit" => {
+                let plain = b64_decode(req["plain_b64"].as_str().unwrap()).unwrap();
+                let entropy = b64_decode(req["entropy_b64"].as_str().unwrap()).unwrap();
+                let pwd = req["pwd"].as_str().unwrap();
+                let salt = req["salt_b64"].as_str().unwrap();
+                let v = json!({
+                    "blob_b64": protect(&plain, &entropy).unwrap(),
+                    "blob_noent_b64": protect(&plain, &[]).unwrap(),
+                    "entropy_b64": req["entropy_b64"],
+                    "salt_b64": salt,
+                    "derive_1000": b64_encode(&derive(pwd, salt, 1000).unwrap()),
+                    "derive_150000": b64_encode(&derive(pwd, salt, 150_000).unwrap()),
+                    "random1": random_b64().unwrap(),
+                    "random2": random_b64().unwrap(),
+                });
+                fs::write(out_path, v.to_string()).unwrap();
+            }
+            "verify" => {
+                let entropy = b64_decode(req["entropy_b64"].as_str().unwrap()).unwrap();
+                let wrong = b64_decode(req["wrong_entropy_b64"].as_str().unwrap()).unwrap();
+                let expect = b64_decode(req["expect_plain_b64"].as_str().unwrap()).unwrap();
+                let ent_ok = unprotect(req["blob_b64"].as_str().unwrap(), &entropy)
+                    .map(|p| p == expect).unwrap_or(false);
+                let noent_ok = unprotect(req["blob_noent_b64"].as_str().unwrap(), &[])
+                    .map(|p| p == expect).unwrap_or(false);
+                let wrong_rejected = unprotect(req["blob_b64"].as_str().unwrap(), &wrong).is_err();
+                let v = json!({"ent_ok": ent_ok, "noent_ok": noent_ok, "wrong_rejected": wrong_rejected});
+                fs::write(out_path, v.to_string()).unwrap();
+                assert!(ent_ok && noent_ok && wrong_rejected, "生产 unprotect 校验失败：{v}");
+            }
+            other => panic!("未知 golden mode：{other}"),
+        }
+    }
+
+    // ---------------- T15 切生产：原生路径独立性（禁 PowerShell 仍全通） ----------------
+    // 证明生产四原语真的走原生（而非永远靠 PS 回退兜底）。
+    // 注意：PS_DISABLED_FOR_TEST 是进程级全局，本测试独占使用并在结尾还原；
+    // 同进程其它 DPAPI 测试若并行运行会受影响——用串行锁把它们隔开。
+    static T15_SERIAL: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn t15_native_path_works_without_powershell() {
+        if !supported() {
+            return;
+        }
+        let _g = T15_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        PS_DISABLED_FOR_TEST.store(true, Ordering::SeqCst);
+        let result = (|| {
+            // protect + unprotect（含 entropy）全走原生
+            let ent = b"t15-native-only-entropy";
+            let blob = protect(b"t15-native-only-payload", ent)?;
+            assert_eq!(unprotect(&blob, ent)?, b"t15-native-only-payload");
+            assert!(unprotect(&blob, b"wrong").is_err(), "错 entropy 必须拒绝（无 PS 兜底）");
+            // 无 entropy 路径
+            let b2 = protect(b"no-ent", &[])?;
+            assert_eq!(unprotect(&b2, &[])?, b"no-ent");
+            // derive 进程内 PBKDF2
+            let salt = b64_encode(b"0123456789abcdef");
+            let k = derive("t15-pwd", &salt, 1000)?;
+            assert_eq!(k.len(), 32);
+            assert_eq!(k, derive("t15-pwd", &salt, 1000)?);
+            // random BCryptGenRandom
+            let r1 = b64_decode(&random_b64()?)?;
+            let r2 = b64_decode(&random_b64()?)?;
+            assert_eq!(r1.len(), 32);
+            assert_ne!(r1, r2);
+            Ok::<(), String>(())
+        })();
+        PS_DISABLED_FOR_TEST.store(false, Ordering::SeqCst);
+        result.expect("原生路径应独立完成全部四原语");
     }
 
     // ---------------- T6 批量落盘：机制测试（不触发 DPAPI/PowerShell） ----------------
