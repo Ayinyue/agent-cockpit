@@ -26,18 +26,23 @@ fn run_shared(homes:Vec<PathBuf>,busy:Vec<PathBuf>)->Result<Value,String>{
     let state_dir=reg::base_dir().join("history-sync");
     // T18 生产接线：侧栏目录重建（每轮热路径）优先走 Rust rebuild_catalog。
     // 成功则告知 python 跳过尾段重建循环（rust_catalog=true，避免双写）；
-    // 失败/不可用则回退 python 全量重建（幂等）。junction/迁移管理仍由 python 负责。
+    // 失败/不可用则回退 python 全量重建（幂等）。
     let mut rust_catalog=false;
     if let Ok(v)=crate::chatgpt_history_sync::rebuild_catalog(&native_home(),&homes,&state_dir){
         rust_catalog=v["ok"]==true;
     }
-    run_python(include_str!("../scripts/chatgpt-history-shared.py"),json!({
+    // T18 第六批：migrate 管理（junction/整库对账/WAL 退役/备份回滚）已迁 Rust
+    // （chatgpt_history_shared::run，golden 钉住报告+迁移后全内容一致）。
+    // 成功即返回；失败回退 python 全量（幂等：marker/备份/union 校验保证可安全重跑）。
+    let request=json!({
         "canonical":native_home(),"homes":homes,"busy_homes":busy,
         "state_dir":state_dir,
         "rust_catalog":rust_catalog,
         "sync_script":include_str!("../scripts/chatgpt-history-sync.py"),
         "history_script":include_str!("../scripts/chatgpt-history.py")
-    }))
+    });
+    if let Ok(v)=crate::chatgpt_history_shared::run(&request){return Ok(v);}
+    run_python(include_str!("../scripts/chatgpt-history-shared.py"),request)
 }
 
 fn run_script(request:Value)->Result<Value,String>{
@@ -45,7 +50,8 @@ fn run_script(request:Value)->Result<Value,String>{
     // 与 python 逐字段一致）。原生路径免 python 冷启；失败回退 python。
     // T18 第五批：copy_history（默认 mode）已迁 Rust（chatgpt_history_copy::run，golden 钉住
     // report + 复制后目标全内容一致）。失败回退 python（staging 独占发布幂等）。
-    // shared-history 的 migrate 管理（junction/WAL 退役）仍走 python（数据丢失级，未迁）。
+    // T18 第六批：shared migrate 管理已迁 Rust（chatgpt_history_shared::run，见 run_shared）。
+    // 本函数只处理 history.py 的 repair/copy 两个 mode。
     if request.get("mode").and_then(|v|v.as_str())==Some("repair_projects"){
         if let Ok(v)=crate::chatgpt_history_repair::run(&request){return Ok(v);}
     } else if request.get("mode").is_none() {

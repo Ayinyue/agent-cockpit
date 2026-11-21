@@ -21,7 +21,7 @@ use crate::chatgpt_history_repair::{atomic_bytes, key, ordinary, uuid_hex};
 struct Cand { root: PathBuf, row: Value, path: PathBuf, relative: PathBuf, fp: Value }
 
 /// JSON 值 → rusqlite 可绑定值（Null/整数/浮点/文本；数组/对象序列化为文本）。
-fn to_sql(v: &Value) -> rusqlite::types::Value {
+pub(crate) fn to_sql(v: &Value) -> rusqlite::types::Value {
     match v {
         Value::Null => rusqlite::types::Value::Null,
         Value::Bool(b) => rusqlite::types::Value::Integer(if *b { 1 } else { 0 }),
@@ -35,12 +35,12 @@ fn to_sql(v: &Value) -> rusqlite::types::Value {
 }
 
 /// 与 python qi 对齐：SQL 标识符双引号转义。
-fn qi(name: &str) -> String {
+pub(crate) fn qi(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// 与 python settings_only 对齐：event_msg + thread_settings_applied。
-fn settings_only(line: &[u8]) -> bool {
+pub(crate) fn settings_only(line: &[u8]) -> bool {
     let Ok(v) = serde_json::from_slice::<Value>(line) else { return false };
     v.get("type").and_then(|t| t.as_str()) == Some("event_msg")
         && v.get("payload").and_then(|p| p.get("type")).and_then(|t| t.as_str())
@@ -48,7 +48,7 @@ fn settings_only(line: &[u8]) -> bool {
 }
 
 /// 与 python internal_thread 对齐：subagent/guardian_review 或 source 含 subagent。
-fn internal_thread(row: &Value) -> bool {
+pub(crate) fn internal_thread(row: &Value) -> bool {
     if let Some(s) = row.get("thread_source").and_then(|v| v.as_str()) {
         if s == "subagent" || s == "guardian_review" { return true; }
     }
@@ -60,7 +60,7 @@ fn internal_thread(row: &Value) -> bool {
 }
 
 /// 按 \n 切行并保留行尾（与 python splitlines(keepends=True) 的 JSONL 口径对齐）。
-fn lines_keepends(data: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn lines_keepends(data: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut start = 0;
     for i in 0..data.len() {
@@ -75,7 +75,7 @@ fn lines_keepends(data: &[u8]) -> Vec<&[u8]> {
 
 /// 与 python replace_offset 对齐：incoming 是 current 的追加 → 返回 len(current)；
 /// 否则找公共前缀行，若 current 剩余行全是 settings_only → 返回公共前缀字节数；否则 None（冲突）。
-fn replace_offset(current: &[u8], incoming: &[u8]) -> Option<usize> {
+pub(crate) fn replace_offset(current: &[u8], incoming: &[u8]) -> Option<usize> {
     if incoming.starts_with(current) {
         return Some(current.len());
     }
@@ -93,7 +93,7 @@ fn replace_offset(current: &[u8], incoming: &[u8]) -> Option<usize> {
 }
 
 /// 与 python snapshot 对齐：读前后 stat 一致才认；去掉末尾不完整行；校验首末行 JSON。
-fn snapshot(path: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn snapshot(path: &Path) -> Result<Vec<u8>, String> {
     ordinary(path)?;
     let before = std::fs::metadata(path).map_err(|e| e.to_string())?;
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -133,7 +133,7 @@ fn rollout_path(root: &Path, row: &Value) -> Result<(PathBuf, PathBuf), String> 
 }
 
 /// 与 python connect 对齐：mode=ro（query_only）或 mode=rw。
-fn connect(path: &Path, write: bool) -> Result<rusqlite::Connection, String> {
+pub(crate) fn connect(path: &Path, write: bool) -> Result<rusqlite::Connection, String> {
     ordinary(path)?;
     let flags = if write {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI
@@ -146,14 +146,14 @@ fn connect(path: &Path, write: bool) -> Result<rusqlite::Connection, String> {
     Ok(conn)
 }
 
-fn columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>, String> {
+pub(crate) fn columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>, String> {
     let sql = format!("PRAGMA table_info({})", qi(table));
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(1)).map_err(|e| e.to_string())?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-fn row_to_json(row: &rusqlite::Row, cols: &[String]) -> Result<Value, rusqlite::Error> {
+pub(crate) fn row_to_json(row: &rusqlite::Row, cols: &[String]) -> Result<Value, rusqlite::Error> {
     let mut obj = serde_json::Map::new();
     for (i, name) in cols.iter().enumerate() {
         let v = row.get_ref(i)?;
@@ -170,7 +170,7 @@ fn row_to_json(row: &rusqlite::Row, cols: &[String]) -> Result<Value, rusqlite::
 }
 
 /// 与 python rows 对齐：SELECT * FROM table [WHERE thread_id=?]，返回 JSON object 列表。
-fn rows(conn: &rusqlite::Connection, table: &str, thread: Option<&str>) -> Result<Vec<Value>, String> {
+pub(crate) fn rows(conn: &rusqlite::Connection, table: &str, thread: Option<&str>) -> Result<Vec<Value>, String> {
     let cols = columns(conn, table)?;
     if cols.is_empty() { return Ok(Vec::new()); }
     let (sql, use_thread) = match thread {
@@ -195,7 +195,7 @@ fn rows(conn: &rusqlite::Connection, table: &str, thread: Option<&str>) -> Resul
 /// 用 Win32 LockFileEx（独占+立即失败）——与 CRT _locking 共享同一套 OS 字节范围锁，
 /// 因此 Rust 与 python 的锁互斥互通。不能用 _locking FFI：它要 CRT fd 而非 HANDLE。
 #[cfg(windows)]
-mod filelock {
+pub(crate) mod filelock {
     use std::fs::File;
     use std::os::windows::io::AsRawHandle;
 
@@ -234,7 +234,7 @@ mod filelock {
     }
 }
 #[cfg(not(windows))]
-mod filelock {
+pub(crate) mod filelock {
     pub struct Lock;
     impl Lock {
         pub fn acquire(_path: &std::path::Path) -> Result<Self, String> { Ok(Lock) }
@@ -242,7 +242,7 @@ mod filelock {
     }
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(data);
@@ -250,17 +250,17 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// 与 python Replicator 对齐：指纹缓存 + 备份 + 独占发布 + upsert + 投影/目录复制。
-struct Replicator {
-    directory: PathBuf,
-    cache_file: PathBuf,
-    cache: HashMap<String, Value>,
-    report: Value,
+pub(crate) struct Replicator {
+    pub(crate) directory: PathBuf,
+    pub(crate) cache_file: PathBuf,
+    pub(crate) cache: HashMap<String, Value>,
+    pub(crate) report: Value,
     /// shared 侧目录重建（每 15s）不做整库备份，与 python `rep.backup = lambda: None` 对齐。
-    no_backup: bool,
+    pub(crate) no_backup: bool,
 }
 
 impl Replicator {
-    fn new(state_dir: &Path) -> Result<Self, String> {
+    pub(crate) fn new(state_dir: &Path) -> Result<Self, String> {
         let directory = ordinary(state_dir)?;
         std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
         let cache_file = directory.join("fingerprints.json");
@@ -314,7 +314,7 @@ impl Replicator {
         Ok(value)
     }
 
-    fn publish(&mut self, root: &Path, destination: &Path, data: &[u8]) -> Result<bool, String> {
+    pub(crate) fn publish(&mut self, root: &Path, destination: &Path, data: &[u8]) -> Result<bool, String> {
         ordinary(destination)?;
         if let Some(p) = destination.parent() { std::fs::create_dir_all(p).map_err(|e| e.to_string())?; }
         if !destination.exists() {
@@ -344,7 +344,7 @@ impl Replicator {
         Ok(true)
     }
 
-    fn upsert(&self, conn: &rusqlite::Connection, table: &str, row: &Value, overwrite: bool) -> Result<bool, String> {
+    pub(crate) fn upsert(&self, conn: &rusqlite::Connection, table: &str, row: &Value, overwrite: bool) -> Result<bool, String> {
         let sql = format!("PRAGMA table_info({})", qi(table));
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let info: Vec<(String, i64)> = stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
@@ -368,11 +368,6 @@ impl Replicator {
                 .map_err(|e| e.to_string())?;
             rr.next().and_then(|r| r.ok())
         };
-        if std::env::var("T18_SYNC_DEBUG").is_ok() && table == "threads" {
-            let cnt: i64 = conn.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0)).unwrap_or(-1);
-            let raw: Option<String> = conn.query_row("SELECT id FROM threads WHERE id=?1", [&row_obj[&keys[0]].as_str().unwrap_or("")], |r| r.get(0)).ok();
-            eprintln!("DIAG upsert SELECT key_vals={key_vals:?} old_found={} count={cnt} raw_match={raw:?}", old.is_some());
-        }
         if let Some(old) = &old {
             let old_obj = old.as_object().unwrap();
             if !overwrite || cols.iter().all(|c| old_obj.get(c) == row_obj.get(c)) {
@@ -389,9 +384,6 @@ impl Replicator {
             let q = format!("INSERT INTO {}({}) VALUES({})", qi(table),
                 cols.iter().map(|c| qi(c)).collect::<Vec<_>>().join(","), placeholders);
             let params: Vec<&Value> = cols.iter().map(|c| &row_obj[c]).collect();
-            if std::env::var("T18_SYNC_DEBUG").is_ok() {
-                eprintln!("DIAG upsert INSERT table={table} keys={keys:?} key_vals={key_vals:?} cols={cols:?}");
-            }
             conn.execute(&q, rusqlite::params_from_iter(params.iter().map(|v| to_sql(v)))).map_err(|e| e.to_string())?;
         }
         Ok(true)
@@ -445,7 +437,7 @@ impl Replicator {
         }
     }
 
-    fn catalog(&mut self, root: &Path, row: &Value) -> Result<(), String> {
+    pub(crate) fn catalog(&mut self, root: &Path, row: &Value) -> Result<(), String> {
         let path = root.join("sqlite").join("codex-dev.db");
         if !path.is_file() { return Ok(()); }
         self.backup(root, &path, true)?;
@@ -499,7 +491,7 @@ impl Replicator {
         Ok(())
     }
 
-    fn clean_internal_catalog(&mut self, root: &Path, threads: &HashMap<String, Value>) -> Result<(), String> {
+    pub(crate) fn clean_internal_catalog(&mut self, root: &Path, threads: &HashMap<String, Value>) -> Result<(), String> {
         let path = root.join("sqlite").join("codex-dev.db");
         if !path.is_file() { return Ok(()); }
         self.backup(root, &path, true)?;
@@ -528,7 +520,7 @@ impl Replicator {
         if let Some(a) = self.report[field].as_array_mut() { a.push(item); }
     }
 
-    fn run(&mut self, homes_in: &[PathBuf]) -> Result<Value, String> {
+    pub(crate) fn run(&mut self, homes_in: &[PathBuf]) -> Result<Value, String> {
         let mut homes: Vec<PathBuf> = Vec::new();
         for p in homes_in {
             let p = ordinary(p)?;
