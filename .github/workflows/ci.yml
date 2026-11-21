@@ -32,7 +32,7 @@
 # 不在此跑的（有意排除，不是遗漏）：
 #   - 浏览器套件（tests/*.test.cjs）：需要 Chromium/CDP 环境，另行安排。
 #   - T17_REAL_APPS / AGENTCOCKPIT_HISTORY_SMOKE 等真机抽样：读本机真实档案，CI 无数据且属 opt-in。
-#   - 部署：CI 只编译验证，永不部署。
+#   - 部署：CI 只编译验证 + 发布 GitHub Release 产物，永不部署到任何机器。
 
 name: CI
 
@@ -206,3 +206,82 @@ jobs:
           path: ci-target/release/agent-cockpit.exe
           if-no-files-found: error
           retention-days: 14
+
+  # 全部编译+回归门禁通过后发布 GitHub Release（用户 2026-11-22 要求）。
+  # 设计：
+  #   - 独立 job，needs build-and-test：任何一步红（编译/隐私/回归/golden）都不会发布。
+  #   - 只在 push/dispatch 发布；PR 永不发布（fork PR 的 token 也只读，双保险）。
+  #   - tag = v<Cargo 版本>-build.<run_number>，prerelease=true：
+  #     每轮构建一个不可变 tag（run_number 单调递增），不覆盖既有 Release，
+  #     也不冒充正式版（正式版发布仍由人工把 prerelease 转正或另打 v* tag）。
+  #   - 附 exe + zip + SHA256SUMS.txt；正文带 commit/run 链接与门禁清单，可溯源。
+  #   - contents: write 仅授予本 job（顶层保持 read 最小权限）。
+  publish-release:
+    name: 发布 Release
+    needs: build-and-test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (version + release notes source)
+        uses: actions/checkout@v4
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-cockpit-windows-x64
+          path: dist
+
+      - name: Package zip + sha256 + tag
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/agent-cockpit.exe
+          VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/version *= *"\(.*\)"/\1/')
+          TAG="v${VERSION}-build.${GITHUB_RUN_NUMBER}"
+          ZIP="agent-cockpit-${TAG}-windows-x64.zip"
+          (cd dist && zip -9 "../${ZIP}" agent-cockpit.exe)
+          (cd dist && sha256sum agent-cockpit.exe) > SHA256SUMS.txt
+          sha256sum "${ZIP}" >> SHA256SUMS.txt
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release (prerelease, immutable per-run tag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 同 run 重跑幂等：tag 已存在则更新资产，不重复建。
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/agent-cockpit.exe "$ZIP" SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            echo "release $TAG already exists; assets refreshed"
+          else
+            gh release create "$TAG" dist/agent-cockpit.exe "$ZIP" SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "Agent Cockpit $TAG (CI build)" \
+              --notes "$(cat <<EOF
+          自动构建产物（CI 全门禁通过后发布）。
+
+          - 版本：$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/version *= *"\(.*\)"/\1/')，构建号 ${GITHUB_RUN_NUMBER}
+          - 提交：${GITHUB_SHA}
+          - 工作流运行：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - 门禁：Rust 全量单测 / release 编译（路径脱敏+custom-protocol）/ 源码与二进制隐私门 /
+            Node 粘贴解析 / 离线 Python 回归 11 套 / 跨语言 golden 10 套，全部通过。
+          - 平台：Windows x64（MSVC，Rust 1.100.0）。校验：SHA256SUMS.txt。
+
+          本 Release 为 prerelease（每轮构建一个不可变 tag）；正式版发布由人工确认。
+          EOF
+          )"
+            echo "release $TAG published"
+          fi
