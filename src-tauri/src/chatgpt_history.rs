@@ -23,9 +23,18 @@ pub(super) fn seed(m: &Value) -> Result<Value, String> {
 }
 
 fn run_shared(homes:Vec<PathBuf>,busy:Vec<PathBuf>)->Result<Value,String>{
+    let state_dir=reg::base_dir().join("history-sync");
+    // T18 生产接线：侧栏目录重建（每轮热路径）优先走 Rust rebuild_catalog。
+    // 成功则告知 python 跳过尾段重建循环（rust_catalog=true，避免双写）；
+    // 失败/不可用则回退 python 全量重建（幂等）。junction/迁移管理仍由 python 负责。
+    let mut rust_catalog=false;
+    if let Ok(v)=crate::chatgpt_history_sync::rebuild_catalog(&native_home(),&homes,&state_dir){
+        rust_catalog=v["ok"]==true;
+    }
     run_python(include_str!("../scripts/chatgpt-history-shared.py"),json!({
         "canonical":native_home(),"homes":homes,"busy_homes":busy,
-        "state_dir":reg::base_dir().join("history-sync"),
+        "state_dir":state_dir,
+        "rust_catalog":rust_catalog,
         "sync_script":include_str!("../scripts/chatgpt-history-sync.py"),
         "history_script":include_str!("../scripts/chatgpt-history.py")
     }))

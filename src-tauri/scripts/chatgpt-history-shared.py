@@ -93,8 +93,11 @@ def private_files(directory):
 
 
 class SharedHistory:
-    def __init__(self, canonical, state_dir, replica, history=None):
+    def __init__(self, canonical, state_dir, replica, history=None, rust_catalog=False):
         self.replica, self.history = replica, history
+        # T18 生产接线：Rust rebuild_catalog 已成功重建侧栏目录时置 True，
+        # 跳过本脚本尾段的 python 重建循环（避免双写）。默认 False 保持原行为。
+        self.rust_catalog = rust_catalog
         self.canonical = replica.plain(Path(canonical))
         self.state_dir = replica.plain(Path(state_dir))
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -372,8 +375,9 @@ class SharedHistory:
         self.normalize_paths(homes)
         # Only rebuild the small per-window sidebar cache; never copy message
         # text, SQLite databases or session files after migration.
+        # T18：Rust rebuild_catalog 已成功时跳过（rust_catalog=True），避免双写。
         db = self.canonical / 'state_5.sqlite'
-        if db.is_file():
+        if db.is_file() and not self.rust_catalog:
             with closing(self.replica.connect(db)) as con:
                 threads = {r['id']: r for r in self.replica.rows(con, 'threads')}
             backup = self.rep.backup
@@ -398,7 +402,8 @@ def synchronize(request):
     replica = support('replica', request.get('sync_script'))
     history = support('history', request.get('history_script')) if request.get('history_script') or '__file__' in globals() else None
     with replica.lock_file(Path(request['state_dir']) / 'sync.lock'):
-        return SharedHistory(request['canonical'], request['state_dir'], replica, history).run(request['homes'], request.get('busy_homes', []))
+        return SharedHistory(request['canonical'], request['state_dir'], replica, history,
+                             rust_catalog=bool(request.get('rust_catalog'))).run(request['homes'], request.get('busy_homes', []))
 
 
 if __name__ == '__main__':

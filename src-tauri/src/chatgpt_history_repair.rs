@@ -556,7 +556,7 @@ pub fn repair_projects(source: &Path, target: &Path, dry_run: bool, expected_pla
 }
 
 /// 与 python _atomic_bytes 对齐：独占临时文件 + fsync + os.replace。
-fn atomic_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
     ordinary(path)?;
     let temporary = path.with_file_name(format!(".project-repair-{}.tmp", uuid_hex()));
     let write_result = (|| -> Result<(), String> {
@@ -580,7 +580,7 @@ fn atomic_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
 }
 
 /// 简易 uuid hex（无新增依赖：时间戳+进程id+计数器的 sha256 前 32 位）。
-fn uuid_hex() -> String {
+pub(crate) fn uuid_hex() -> String {
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
