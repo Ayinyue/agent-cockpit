@@ -230,7 +230,8 @@ def main():
     # python 侧 shutil.rmtree(stage)（retention scan incomplete），属环境限制非产品缺陷。
     scratch = os.environ.get('BOX_AGENT_SCRATCH_DIR')
     parent = pathlib.Path(scratch) if scratch and pathlib.Path(scratch).is_dir() else None
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix='t18-shared-golden-', dir=str(parent) if parent else None))
+    # CI runner TEMP 可能含 8.3 短名：先 resolve 再建 fixture（与生产 plain+resolve 同口径）。
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix='t18-shared-golden-', dir=str(parent) if parent else None)).resolve()
     try:
         for kind in ('migrate', 'busy', 'conflict', 'interrupted'):
             code = run_case(kind, tmp)
