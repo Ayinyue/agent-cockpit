@@ -260,6 +260,7 @@
 
 | **T15 切生产**（2026-11-22，用户「按建议执行」） | `secrets.rs` 生产四原语去 PowerShell：**protect/unprotect** 原生 CryptProtectData/CryptUnprotectData 优先（dpapi_native，CurrentUser+UI_FORBIDDEN 同口径），失败回退 PS 再试（两通道任一成功即可，都失败返回 PS 错误与旧版口径相同，load() 据此保持锁定）；**derive** 进程内 PBKDF2-HMAC-SHA512（agentcrypt，.NET Rfc2898 字符串密码同按 UTF-8 取字节）；**random_b64** BCryptGenRandom（与 antigravity/remote 生产同款 CSPRNG，失败回退 PS，绝不退可预测随机）。PS 通道保留为回退不删。新增 cfg(test) PS_DISABLED_FOR_TEST 开关+串行锁 | **真实 vault 只读双通道探针**（tests/t15-real-vault-readonly-probe.py）：本机真实 vault（3 凭据，无主密码）PS 解 vs 原生解 sha256 逐字节一致（022eb6fb…，14699 字节），明文 JSON 结构与 count 相符；原生 Protect→PS Unprotect 写路径互操作一致；vault 零写入。**跨语言 golden**（tests/t15-secrets-golden.test.py，双向）：A Rust 生产 protect（含/无 entropy）→PS 解一致 + derive 1000/150000 轮 vs .NET Rfc2898 逐字节一致 + random 32 字节两次不同；B PS 密文→Rust 生产 unprotect 一致 + 错 entropy 拒绝。**3 条变异红**：原生 unprotect 丢 entropy（独立性测试红——功能 golden 因 PS 回退兜底抓不到，故补「禁 PS 原生独立完成」测试）/ derive 字节篡改（golden A3 红）/ 还原零残留。secrets 6 单测绿；全量 **556 项 = 522 过 / 0 失败 / 34 忽略**（554→556 +2）。privacy 0。CI golden 登记至 **11 套**。**已提交 bedb650，fork CI run#15 全绿**：Rust 全量 3m40s / release 6m58s / 隐私门 / Node / 离线回归 1m09s / **golden 11/11** 1m39s（含 t15-secrets 双向）/ 产物上传；publish-release 5 步全 success，**v2.6.0-build.15 已发布**（首个含原生 DPAPI 保管箱的 Release） |
 
+
 **顺带修掉的 4 套既有测试缺陷**（都不是本轮引入，在 Chrome 上同样会红）：
 - `add-app-picker` / `external-checkin` / `checkin-pending-day` / `workbuddy-accounts`：未屏蔽新手引导，
   `.tourmask` 600ms 后拦截点击 —— 此前靠「抢在引导出现前点完」的时序运气偶尔通过。

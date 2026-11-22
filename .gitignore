@@ -63,3 +63,6 @@ release-private/
 
 # Playwright 运行产物
 test-results/
+
+# 本机私有留档（部署/pid/本机路径等，按用户规矩不入库不推送）
+LOCAL_NOTES.md
